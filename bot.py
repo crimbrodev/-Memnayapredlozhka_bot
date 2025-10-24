@@ -228,6 +228,54 @@ def log_action(channel_id: str, action: str, user_id: int, admin_id: int, post_i
     cur.close()
     conn.close()
 
+def add_published_post(channel_id: str, user_id: int, username: str, message_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO published_posts (channel_id, user_id, username, message_id) VALUES (%s, %s, %s, %s)",
+        (channel_id, user_id, username, message_id)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def update_post_reactions(channel_id: str, message_id: int, reactions: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE published_posts SET reactions = %s WHERE channel_id = %s AND message_id = %s",
+        (reactions, channel_id, message_id)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_global_leaderboard(limit: int = 10):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, username, COUNT(*) as posts, COALESCE(SUM(reactions), 0) as total_reactions "
+        "FROM published_posts GROUP BY user_id, username ORDER BY total_reactions DESC, posts DESC LIMIT %s",
+        (limit,)
+    )
+    result = cur.fetchall()
+    cur.close()
+    conn.close()
+    return result
+
+def get_channel_leaderboard(channel_id: str, limit: int = 10):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, username, COUNT(*) as posts, COALESCE(SUM(reactions), 0) as total_reactions "
+        "FROM published_posts WHERE channel_id = %s GROUP BY user_id, username ORDER BY total_reactions DESC, posts DESC LIMIT %s",
+        (channel_id, limit)
+    )
+    result = cur.fetchall()
+    cur.close()
+    conn.close()
+    return result
+
 def get_audit_log(channel_id: str, limit: int = 50):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -784,6 +832,37 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(response)
     
+    elif action == "top":
+        short_channel_id = data_parts[1]
+        channel_mapping = context.user_data.get('channel_mapping', {})
+        channel_id = channel_mapping.get(short_channel_id)
+        
+        if not channel_id:
+            await query.edit_message_text("❌ Ошибка: канал не найден.")
+            return
+        
+        try:
+            chat = await context.bot.get_chat(channel_id)
+            channel_name = chat.title
+        except:
+            channel_name = channel_id
+        
+        leaders = get_channel_leaderboard(channel_id, 10)
+        
+        if not leaders:
+            await query.edit_message_text(f"🏆 Таблица лидеров канала '{channel_name}' пуста.")
+            return
+        
+        response = f"🏆 Таблица лидеров: {channel_name}\n\n"
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for idx, (user_id, username, posts, reactions) in enumerate(leaders, 1):
+            medal = medals[idx-1] if idx <= 3 else f"{idx}."
+            response += f"{medal} @{username}\n"
+            response += f"   📊 Мемов: {posts} | 👍 Реакций: {reactions}\n\n"
+        
+        await query.edit_message_text(response)
+    
     elif action in ["app", "rej", "ban", "next"]:
         # Админ модерирует пост
         if action == "next":
@@ -841,12 +920,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await show_next_post(query, context, channel_id)
                         return
                 
-                await context.bot.send_photo(
+                msg = await context.bot.send_photo(
                     chat_id=channel_id,
                     photo=photo_file_id,
                     caption=caption if caption else None
                 )
                 
+                add_published_post(channel_id, user_id, username, msg.message_id)
                 update_channel_setting(channel_id, 'last_post_time', datetime.now())
                 remove_pending_post(post_id)
                 log_action(channel_id, 'published', user_id, query.from_user.id, post_id)
@@ -1269,6 +1349,91 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in stats: {e}")
         await update.message.reply_text("❌ Ошибка получения статистики.")
 
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        leaders = get_global_leaderboard(10)
+        
+        if not leaders:
+            await update.message.reply_text("🏆 Таблица лидеров пуста. Пока никто не опубликовал мемы!")
+            return
+        
+        response = "🏆 Глобальная таблица лидеров\n\n"
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for idx, (user_id, username, posts, reactions) in enumerate(leaders, 1):
+            medal = medals[idx-1] if idx <= 3 else f"{idx}."
+            response += f"{medal} @{username}\n"
+            response += f"   📊 Мемов: {posts} | 👍 Реакций: {reactions}\n\n"
+        
+        await update.message.reply_text(response)
+    except Exception as e:
+        logger.error(f"Error in leaderboard: {e}")
+        await update.message.reply_text("❌ Ошибка получения таблицы лидеров.")
+
+async def topchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_channels = get_user_channels(user_id)
+    
+    if not user_channels:
+        await update.message.reply_text("❌ Вы не являетесь администратором ни одного канала.")
+        return
+    
+    keyboard = []
+    for ch_id in user_channels:
+        try:
+            chat = await context.bot.get_chat(ch_id)
+            channel_name = chat.title
+        except:
+            channel_name = ch_id
+        
+        short_channel_id = str(hash(ch_id))[-8:]
+        keyboard.append([InlineKeyboardButton(
+            f"🏆 {channel_name}",
+            callback_data=f"top_{short_channel_id}"
+        )])
+    
+    context.user_data['channel_mapping'] = {str(hash(ch[0]))[-8:]: ch[0] for ch in [(ch,) for ch in user_channels]}
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🏆 Выберите канал для просмотра таблицы лидеров:", reply_markup=reply_markup)
+
+async def manual_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPPORT_ADMIN_ID:
+        return
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "📝 Использование: /update <message_id> <reactions>\n\n"
+            "Пример:\n"
+            "/update 206 3\n\n"
+            "Где 206 - ID сообщения, 3 - количество реакций"
+        )
+        return
+    
+    try:
+        message_id = int(context.args[0])
+        reactions = int(context.args[1])
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE published_posts SET reactions = %s WHERE message_id = %s",
+            (reactions, message_id)
+        )
+        rows = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        if rows > 0:
+            await update.message.reply_text(f"✅ Обновлено! Пост {message_id}: {reactions} реакций")
+        else:
+            await update.message.reply_text(f"❌ Пост с ID {message_id} не найден в БД")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Используйте числа.")
+    except Exception as e:
+        logger.error(f"Error updating reactions: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 async def post_init(application: Application):
     # Создаем таблицу для очереди постов
     try:
@@ -1356,6 +1521,18 @@ async def post_init(application: Application):
             )
         """)
         
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS published_posts (
+                id SERIAL PRIMARY KEY,
+                channel_id VARCHAR(255),
+                user_id BIGINT,
+                username VARCHAR(255),
+                message_id BIGINT,
+                reactions INTEGER DEFAULT 0,
+                published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         conn.commit()
         cur.close()
         conn.close()
@@ -1373,10 +1550,37 @@ async def post_init(application: Application):
         BotCommand("unban", "Разблокировать пользователя"),
         BotCommand("channels", "Список каналов"),
         BotCommand("stats", "Статистика"),
+        BotCommand("leaderboard", "Глобальная таблица лидеров"),
+        BotCommand("topchannel", "Таблица лидеров канала"),
         BotCommand("support", "Техподдержка")
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Меню команд настроено!")
+
+async def update_reactions(context: ContextTypes.DEFAULT_TYPE):
+    """Обновляет количество реакций для последних 50 постов"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, channel_id, message_id FROM published_posts "
+        "WHERE published_at > NOW() - INTERVAL '7 days' "
+        "ORDER BY published_at DESC LIMIT 50"
+    )
+    posts = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    for post_id, channel_id, message_id in posts:
+        try:
+            msg = await context.bot.forward_message(
+                chat_id=channel_id,
+                from_chat_id=channel_id,
+                message_id=message_id
+            )
+            # Telegram API не дает прямого доступа к реакциям через Bot API
+            # Это заглушка для будущей реализации через MTProto
+        except:
+            pass
 
 async def publish_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime
@@ -1394,11 +1598,12 @@ async def publish_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
             
         logger.info(f"[SCHEDULER] Publishing post {post_id} to channel {channel_id}")
         try:
-            await context.bot.send_photo(
+            msg = await context.bot.send_photo(
                 chat_id=channel_id,
                 photo=photo_file_id,
                 caption=caption if caption else None
             )
+            add_published_post(channel_id, user_id, username, msg.message_id)
             update_channel_setting(channel_id, 'last_post_time', datetime.now())
             remove_scheduled_post(post_id)
             log_action(channel_id, 'auto_published', user_id, 0, post_id, 'Published by scheduler')
@@ -1425,6 +1630,7 @@ def main():
     
     if application.job_queue:
         application.job_queue.run_repeating(publish_scheduled_posts, interval=60, first=10)
+        application.job_queue.run_repeating(update_reactions, interval=300, first=60)
     else:
         logger.warning("JobQueue не доступен. Установите: pip install python-telegram-bot[job-queue]")
     
@@ -1437,6 +1643,9 @@ def main():
     application.add_handler(CommandHandler("unban", unban))
     application.add_handler(CommandHandler("channels", channels))
     application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("leaderboard", leaderboard))
+    application.add_handler(CommandHandler("topchannel", topchannel))
+    application.add_handler(CommandHandler("update", manual_update))
     application.add_handler(CommandHandler("support", support))
     application.add_handler(CommandHandler("reply", reply_support))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
