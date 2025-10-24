@@ -1630,7 +1630,6 @@ def main():
     
     if application.job_queue:
         application.job_queue.run_repeating(publish_scheduled_posts, interval=60, first=10)
-        application.job_queue.run_repeating(update_reactions, interval=300, first=60)
     else:
         logger.warning("JobQueue не доступен. Установите: pip install python-telegram-bot[job-queue]")
     
