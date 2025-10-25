@@ -1017,9 +1017,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"✅ Автомодерация {'ON' if new_value else 'OFF'}")
             keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data=f"set_{short_channel_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
+            status_text = "ON" if new_value else "OFF"
+            details_text = "🛡️ Проверяется:\n• Дубликаты мемов\n• Качество изображения\n• Спам и реклама\n• Частота отправки" if new_value else "❌ Автоматическая проверка отключена"
             await query.edit_message_text(
-                f"✅ Автомодерация: {'ON' if new_value else 'OFF'}\n\n"
-                f"{'🛡️ Проверяется:\n• Дубликаты мемов\n• Качество изображения\n• Спам и реклама\n• Частота отправки' if new_value else '❌ Автоматическая проверка отключена'}",
+                f"✅ Автомодерация: {status_text}\n\n{details_text}",
                 reply_markup=reply_markup
             )
         elif setting_type == "analytics":
