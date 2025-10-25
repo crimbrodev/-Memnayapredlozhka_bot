@@ -419,23 +419,33 @@ def check_daily_quests(user_id: int, username: str):
     quests = {row[0]: row[1] for row in cur.fetchall()}
     
     if not quests:
-        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'post_1', 5)", (user_id, today))
-        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'reactions_50', 10)", (user_id, today))
-        quests = {'post_1': False, 'reactions_50': False}
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'post_1', 10)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'post_3', 30)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'post_5', 50)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'streak_3', 100)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'open_lootbox', 20)", (user_id, today))
+        quests = {'post_1': False, 'post_3': False, 'post_5': False, 'streak_3': False, 'open_lootbox': False}
     
     cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s AND DATE(published_at) = %s", (user_id, today))
     posts_today = cur.fetchone()[0]
     
     if posts_today >= 1 and not quests.get('post_1'):
         cur.execute("UPDATE daily_quests SET completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE user_id = %s AND quest_date = %s AND quest_type = 'post_1'", (user_id, today))
-        add_coins(user_id, username, 5, "✅ Задание: Отправить мем")
+        add_coins(user_id, username, 10, "✅ Задание: 1 мем")
     
-    cur.execute("SELECT COALESCE(SUM(reactions), 0) FROM published_posts WHERE user_id = %s AND DATE(published_at) = %s", (user_id, today))
-    reactions_today = cur.fetchone()[0]
+    if posts_today >= 3 and not quests.get('post_3'):
+        cur.execute("UPDATE daily_quests SET completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE user_id = %s AND quest_date = %s AND quest_type = 'post_3'", (user_id, today))
+        add_coins(user_id, username, 30, "✅ Задание: 3 мема")
     
-    if reactions_today >= 50 and not quests.get('reactions_50'):
-        cur.execute("UPDATE daily_quests SET completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE user_id = %s AND quest_date = %s AND quest_type = 'reactions_50'", (user_id, today))
-        add_coins(user_id, username, 10, "✅ Задание: 50 реакций")
+    if posts_today >= 5 and not quests.get('post_5'):
+        cur.execute("UPDATE daily_quests SET completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE user_id = %s AND quest_date = %s AND quest_type = 'post_5'", (user_id, today))
+        add_coins(user_id, username, 50, "✅ Задание: 5 мемов")
+    
+    cur.execute("SELECT current_streak FROM user_streaks WHERE user_id = %s", (user_id,))
+    streak_result = cur.fetchone()
+    if streak_result and streak_result[0] >= 3 and not quests.get('streak_3'):
+        cur.execute("UPDATE daily_quests SET completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE user_id = %s AND quest_date = %s AND quest_type = 'streak_3'", (user_id, today))
+        add_coins(user_id, username, 100, "✅ Задание: Стрик 3 дня")
     
     conn.commit()
     cur.close()
@@ -808,6 +818,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data_parts = query.data.split("_")
     action = data_parts[0]
+    
+    if action == "adm":
+        admin_action = data_parts[1]
+        if admin_action == "moderate":
+            await moderate(query, context)
+            return
+        elif admin_action == "addchannel":
+            await query.edit_message_text("➕ Используйте: /addchannel <channel_id>\n\nПример: /addchannel @mychannel")
+            return
+        elif admin_action == "settings":
+            await settings(query, context)
+            return
+        elif admin_action == "stats":
+            await stats(query, context)
+            return
+        elif admin_action == "queue":
+            await queue(query, context)
+            return
+        elif admin_action == "audit":
+            await audit(query, context)
+            return
+        elif admin_action == "unban":
+            await unban(query, context)
+            return
+        elif admin_action == "channels":
+            await channels(query, context)
+            return
+        elif admin_action == "topchannel":
+            await topchannel(query, context)
+            return
     
     if action == "all":
         user_id = int(data_parts[1])
@@ -1202,7 +1242,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         username = query.from_user.username or query.from_user.first_name
         
-        costs = {'priority': 50, 'skip': 100, 'pin': 200}
+        costs = {'priority': 1000, 'skip': 2000, 'pin': 3000}
         cost = costs.get(item_type, 0)
         
         if buy_shop_item(user_id, username, item_type, cost, 24):
@@ -1882,7 +1922,10 @@ async def quests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     quest_names = {
         'post_1': '📤 Отправить 1 мем',
-        'reactions_50': '👍 Получить 50 реакций'
+        'post_3': '📤 Отправить 3 мема',
+        'post_5': '📤 Отправить 5 мемов',
+        'streak_3': '🔥 Стрик 3 дня',
+        'open_lootbox': '🎁 Открыть лутбокс'
     }
     
     for quest_type, completed, reward in quests:
@@ -1900,18 +1943,18 @@ async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance, _ = get_user_balance(user_id)
     
     keyboard = [
-        [InlineKeyboardButton("⚡ Приоритет (50 монет)", callback_data="buy_priority")],
-        [InlineKeyboardButton("🎫 Пропуск модерации (100 монет)", callback_data="buy_skip")],
-        [InlineKeyboardButton("📌 Закрепить пост (200 монет)", callback_data="buy_pin")]
+        [InlineKeyboardButton("⚡ Приоритет (1000 монет)", callback_data="buy_priority")],
+        [InlineKeyboardButton("🎫 Пропуск модерации (2000 монет)", callback_data="buy_skip")],
+        [InlineKeyboardButton("📌 Закрепить пост (3000 монет)", callback_data="buy_pin")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         f"🛒 Магазин привилегий\n\n"
         f"💰 Ваш баланс: {balance} монет\n\n"
-        f"⚡ Приоритет - ваш мем будет модерироваться первым\n"
-        f"🎫 Пропуск - мем публикуется без модерации\n"
-        f"📌 Закрепить - пост будет закреплен на 24ч",
+        f"⚡ Приоритет (1000) - ваш мем будет модерироваться первым\n"
+        f"🎫 Пропуск (2000) - мем публикуется без модерации\n"
+        f"📌 Закрепить (3000) - пост будет закреплен на 24ч",
         reply_markup=reply_markup
     )
 
@@ -2080,6 +2123,16 @@ async def lootbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("UPDATE lootboxes SET opened = TRUE WHERE id = %s", (box_id,))
     conn.commit()
     add_coins(user_id, username, reward, "🎁 Лутбокс")
+    
+    from datetime import date
+    today = date.today()
+    cur.execute("SELECT completed FROM daily_quests WHERE user_id = %s AND quest_date = %s AND quest_type = 'open_lootbox'", (user_id, today))
+    quest_result = cur.fetchone()
+    if quest_result and not quest_result[0]:
+        cur.execute("UPDATE daily_quests SET completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE user_id = %s AND quest_date = %s AND quest_type = 'open_lootbox'", (user_id, today))
+        add_coins(user_id, username, 20, "✅ Задание: Открыть лутбокс")
+        conn.commit()
+    
     cur.close()
     conn.close()
     await update.message.reply_text(f"🎁 Лутбокс открыт!\n\n💰 +{reward} монет\n📦 Осталось: {available - 1}")
@@ -2107,26 +2160,30 @@ async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = f"https://t.me/{bot_username}?start=ref_{code}"
     await update.message.reply_text(f"🎁 Реферальная программа\n\n👥 Приглашено: {total}\n💰 Награды: {rewarded}\n\n🔗 Ваша ссылка:\n{link}\n\n💵 +100 монет за друга\n💵 +50 когда друг опубликует 5 мемов")
 
-async def rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    username = update.effective_user.username or update.effective_user.first_name
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT avg_rating, total_ratings FROM user_ratings WHERE user_id = %s", (user_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    if not result or result[1] == 0:
-        await update.message.reply_text("⭐ Нет рейтинга\n\nОпубликуйте мемы для оценки!")
+    
+    if not is_channel_admin(user_id):
+        await update.message.reply_text("❌ Эта команда доступна только администраторам каналов.")
         return
-    avg, total = result
-    stars = "⭐" * int(avg)
-    response = f"⭐ Рейтинг @{username}\n\n{stars} {avg:.2f}/5.00\n📊 Оценок: {total}\n\n"
-    if avg >= 4.5:
-        response += "🏆 Отличный рейтинг! +10% монет"
-    elif avg < 2.0 and total >= 10:
-        response += "⚠️ Низкий рейтинг. Улучшите качество!"
-    await update.message.reply_text(response)
+    
+    keyboard = [
+        [InlineKeyboardButton("🛡️ Модерация", callback_data="adm_moderate")],
+        [InlineKeyboardButton("➕ Добавить канал", callback_data="adm_addchannel")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="adm_settings")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="adm_stats")],
+        [InlineKeyboardButton("📝 Очередь", callback_data="adm_queue")],
+        [InlineKeyboardButton("📊 История", callback_data="adm_audit")],
+        [InlineKeyboardButton("🚫 Разбан", callback_data="adm_unban")],
+        [InlineKeyboardButton("📢 Каналы", callback_data="adm_channels")],
+        [InlineKeyboardButton("🏆 Топ канала", callback_data="adm_topchannel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "🛡️ Панель администратора\n\nВыберите действие:",
+        reply_markup=reply_markup
+    )
 
 async def post_init(application: Application):
     # Создаем таблицу для очереди постов
@@ -2269,18 +2326,9 @@ async def post_init(application: Application):
         BotCommand("shop", "Магазин привилегий"),
         BotCommand("lootbox", "Открыть лутбокс"),
         BotCommand("referral", "Реферальная программа"),
-        BotCommand("rating", "Мой рейтинг"),
         BotCommand("weekwinner", "Мем недели"),
         BotCommand("leaderboard", "Таблица лидеров"),
-        BotCommand("moderate", "Модерация постов"),
-        BotCommand("addchannel", "Добавить канал"),
-        BotCommand("settings", "Настройки (Аналитика, AI)"),
-        BotCommand("queue", "Очередь постов"),
-        BotCommand("audit", "История действий"),
-        BotCommand("unban", "Разблокировать"),
-        BotCommand("channels", "Список каналов"),
-        BotCommand("stats", "Статистика"),
-        BotCommand("topchannel", "Топ канала"),
+        BotCommand("admin", "Панель администратора"),
         BotCommand("support", "Техподдержка")
     ]
     await application.bot.set_my_commands(commands)
@@ -2382,7 +2430,7 @@ async def start_bot():
     application.add_handler(CommandHandler("shop", shop))
     application.add_handler(CommandHandler("lootbox", lootbox))
     application.add_handler(CommandHandler("referral", referral))
-    application.add_handler(CommandHandler("rating", rating))
+    application.add_handler(CommandHandler("admin", admin))
     application.add_handler(CommandHandler("weekwinner", weekwinner))
     application.add_handler(CommandHandler("moderate", moderate))
     application.add_handler(CommandHandler("addchannel", addchannel))
