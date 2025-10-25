@@ -1,6 +1,7 @@
 import os
 import logging
 import psycopg2
+import hashlib
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.error import TelegramError
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
-SUPPORT_ADMIN_ID = 6895683980
+SUPPORT_ADMIN_ID = int(os.getenv('SUPPORT_ADMIN_ID', '0'))
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
@@ -185,12 +186,25 @@ def get_channel_settings(channel_id: str):
     return {'interval': 0, 'max_posts': 0, 'require_caption': False, 'media_types': 'photo,video', 'spam_filter': True, 'last_post': None, 'allow_global': True}
 
 def update_channel_setting(channel_id: str, setting: str, value):
+    ALLOWED_SETTINGS = {
+        'post_interval_minutes', 'max_posts_per_day', 'require_caption',
+        'spam_filter_enabled', 'allow_global_posts', 'smart_mode',
+        'aggressiveness', 'auto_moderation', 'last_post_time'
+    }
+    if setting not in ALLOWED_SETTINGS:
+        raise ValueError(f"Invalid setting: {setting}")
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(f"INSERT INTO channel_settings (channel_id, {setting}) VALUES (%s, %s) ON CONFLICT (channel_id) DO UPDATE SET {setting} = %s", (channel_id, value, value))
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        query = f"INSERT INTO channel_settings (channel_id, {setting}) VALUES (%s, %s) ON CONFLICT (channel_id) DO UPDATE SET {setting} = %s"
+        cur.execute(query, (channel_id, value, value))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 def add_scheduled_post(channel_id: str, user_id: int, username: str, photo_file_id: str, caption: str, scheduled_time):
     conn = get_db_connection()
@@ -278,6 +292,197 @@ def get_channel_leaderboard(channel_id: str, limit: int = 10):
     conn.close()
     return result
 
+def add_coins(user_id: int, username: str, amount: int, reason: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO user_coins (user_id, username, balance, total_earned) VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET balance = user_coins.balance + %s, total_earned = user_coins.total_earned + %s, username = %s, updated_at = CURRENT_TIMESTAMP",
+        (user_id, username, amount, amount, amount, amount, username)
+    )
+    cur.execute(
+        "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+        (user_id, amount, reason)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_user_balance(user_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT balance, total_earned FROM user_coins WHERE user_id = %s", (user_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result if result else (0, 0)
+
+def get_user_rank(posts_count: int):
+    if posts_count >= 100:
+        return "👑 Легенда"
+    elif posts_count >= 50:
+        return "🦅 Про-мемер"
+    elif posts_count >= 20:
+        return "🐥 Мемер"
+    elif posts_count >= 5:
+        return "🐣 Любитель"
+    else:
+        return "🥚 Новичок"
+
+def check_and_award_achievements(user_id: int, username: str, posts_count: int):
+    achievements = []
+    if posts_count == 1:
+        add_coins(user_id, username, 20, "🔥 Достижение: Первая кровь")
+        achievements.append("🔥 Первая кровь (+20 монет)")
+    elif posts_count == 10:
+        add_coins(user_id, username, 50, "💯 Достижение: Десятка")
+        achievements.append("💯 Десятка (+50 монет)")
+    elif posts_count == 50:
+        add_coins(user_id, username, 200, "🎊 Достижение: Полтинник")
+        achievements.append("🎊 Полтинник (+200 монет)")
+    elif posts_count == 100:
+        add_coins(user_id, username, 500, "👑 Достижение: Легенда")
+        achievements.append("👑 Легенда (+500 монет)")
+    return achievements
+
+def spend_coins(user_id: int, amount: int, reason: str) -> bool:
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE user_coins SET balance = balance - %s "
+            "WHERE user_id = %s AND balance >= %s RETURNING balance",
+            (amount, user_id, amount)
+        )
+        result = cur.fetchone()
+        if not result:
+            conn.rollback()
+            return False
+        cur.execute(
+            "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+            (user_id, -amount, reason)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error spending coins: {e}")
+        return False
+    finally:
+        cur.close()
+        conn.close()
+
+def update_streak(user_id: int, username: str):
+    from datetime import date, timedelta
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT current_streak, longest_streak, last_post_date FROM user_streaks WHERE user_id = %s", (user_id,))
+    result = cur.fetchone()
+    today = date.today()
+    
+    if not result:
+        cur.execute("INSERT INTO user_streaks (user_id, username, current_streak, longest_streak, last_post_date) VALUES (%s, %s, 1, 1, %s)", (user_id, username, today))
+    else:
+        current, longest, last_date = result
+        if last_date == today:
+            pass
+        elif last_date == today - timedelta(days=1):
+            current += 1
+            longest = max(longest, current)
+            cur.execute("UPDATE user_streaks SET current_streak = %s, longest_streak = %s, last_post_date = %s WHERE user_id = %s", (current, longest, today, user_id))
+            if current == 7:
+                add_coins(user_id, username, 50, "🔥 Стрик 7 дней")
+            elif current == 30:
+                add_coins(user_id, username, 300, "🔥 Стрик 30 дней")
+        else:
+            cur.execute("UPDATE user_streaks SET current_streak = 1, last_post_date = %s WHERE user_id = %s", (today, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_streak(user_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT current_streak, longest_streak FROM user_streaks WHERE user_id = %s", (user_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result if result else (0, 0)
+
+def check_daily_quests(user_id: int, username: str):
+    from datetime import date
+    conn = get_db_connection()
+    cur = conn.cursor()
+    today = date.today()
+    
+    cur.execute("SELECT quest_type, completed FROM daily_quests WHERE user_id = %s AND quest_date = %s", (user_id, today))
+    quests = {row[0]: row[1] for row in cur.fetchall()}
+    
+    if not quests:
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'post_1', 5)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'reactions_50', 10)", (user_id, today))
+        quests = {'post_1': False, 'reactions_50': False}
+    
+    cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s AND DATE(published_at) = %s", (user_id, today))
+    posts_today = cur.fetchone()[0]
+    
+    if posts_today >= 1 and not quests.get('post_1'):
+        cur.execute("UPDATE daily_quests SET completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE user_id = %s AND quest_date = %s AND quest_type = 'post_1'", (user_id, today))
+        add_coins(user_id, username, 5, "✅ Задание: Отправить мем")
+    
+    cur.execute("SELECT COALESCE(SUM(reactions), 0) FROM published_posts WHERE user_id = %s AND DATE(published_at) = %s", (user_id, today))
+    reactions_today = cur.fetchone()[0]
+    
+    if reactions_today >= 50 and not quests.get('reactions_50'):
+        cur.execute("UPDATE daily_quests SET completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE user_id = %s AND quest_date = %s AND quest_type = 'reactions_50'", (user_id, today))
+        add_coins(user_id, username, 10, "✅ Задание: 50 реакций")
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_daily_quests(user_id: int):
+    from datetime import date
+    conn = get_db_connection()
+    cur = conn.cursor()
+    today = date.today()
+    cur.execute("SELECT quest_type, completed, reward FROM daily_quests WHERE user_id = %s AND quest_date = %s", (user_id, today))
+    quests = cur.fetchall()
+    cur.close()
+    conn.close()
+    return quests
+
+def buy_shop_item(user_id: int, username: str, item_type: str, cost: int, duration_hours: int = 0):
+    from datetime import datetime, timedelta
+    if not spend_coins(user_id, cost, f"🛒 Покупка: {item_type}"):
+        return False
+    conn = get_db_connection()
+    cur = conn.cursor()
+    expires = datetime.now() + timedelta(hours=duration_hours) if duration_hours > 0 else None
+    cur.execute("INSERT INTO shop_purchases (user_id, username, item_type, cost, expires_at) VALUES (%s, %s, %s, %s, %s)", (user_id, username, item_type, cost, expires))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return True
+
+def has_active_item(user_id: int, item_type: str):
+    from datetime import datetime
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM shop_purchases WHERE user_id = %s AND item_type = %s AND used = FALSE AND (expires_at IS NULL OR expires_at > %s)", (user_id, item_type, datetime.now()))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result is not None
+
+def use_shop_item(user_id: int, item_type: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE shop_purchases SET used = TRUE WHERE user_id = %s AND item_type = %s AND used = FALSE LIMIT 1", (user_id, item_type))
+    conn.commit()
+    cur.close()
+    conn.close()
+
 def get_audit_log(channel_id: str, limit: int = 50):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -295,6 +500,22 @@ def is_channel_creator(user_id: int, channel_id: str) -> bool:
     cur.close()
     conn.close()
     return result and result[0] == user_id
+
+def validate_channel_id(channel_id: str) -> bool:
+    if not channel_id:
+        return False
+    if channel_id.startswith('@'):
+        return len(channel_id) > 1 and channel_id[1:].replace('_', '').isalnum()
+    if channel_id.startswith('-100'):
+        return channel_id[1:].isdigit() and len(channel_id) >= 13
+    return False
+
+def sanitize_caption(caption: str) -> str:
+    if not caption:
+        return ""
+    caption = caption[:1000]
+    caption = ''.join(char for char in caption if ord(char) >= 32 or char in '\n\r\t')
+    return caption
 
 def check_spam(text: str) -> bool:
     spam_keywords = ['реклама', 'заработок', 'казино', 'ставки', 'кредит', 'займ']
@@ -342,14 +563,14 @@ async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Считаем количество постов в очереди
         pending_count = len(get_pending_posts(ch_id))
         
-        short_channel_id = str(hash(ch_id))[-8:]
+        short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
         keyboard.append([InlineKeyboardButton(
             f"📢 {channel_name} ({pending_count} постов)", 
             callback_data=f"mod_{short_channel_id}"
         )])
     
     # Сохраняем соответствие для админа
-    context.user_data['channel_mapping'] = {str(hash(ch[0]))[-8:]: ch[0] for ch in [(ch,) for ch in user_channels]}
+    context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -374,7 +595,7 @@ async def show_next_post(query, context: ContextTypes.DEFAULT_TYPE, channel_id: 
     except:
         channel_name = channel_id
     
-    short_channel_id = str(hash(channel_id))[-8:]
+    short_channel_id = hashlib.sha256(channel_id.encode()).hexdigest()[:8]
     keyboard = [
         [
             InlineKeyboardButton("✅ Опубликовать", callback_data=f"app_{post_id}_{short_channel_id}"),
@@ -419,11 +640,40 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     photo = update.message.photo[-1]
-    caption = update.message.caption or ""
+    caption = sanitize_caption(update.message.caption or "")
     
-    if check_spam(caption):
-        await update.message.reply_text("⚠️ Обнаружен подозрительный контент. Пожалуйста, не отправляйте рекламу.")
-        return
+    # ФАЗА 4: AI-модерация
+    try:
+        file = await context.bot.get_file(photo.file_id)
+        file_size = file.file_size
+        
+        # Проверяем автомодерацию для каждого канала
+        conn = get_db_connection()
+        photo_hash = str(hash(photo.file_id))[:32]  # Упрощенный хеш
+        
+        # Проверяем базовый спам
+        if check_spam(caption):
+            await update.message.reply_text("⚠️ Обнаружен подозрительный контент. Пожалуйста, не отправляйте рекламу.")
+            conn.close()
+            return
+        
+        # Автомодерация (если включена хотя бы в одном канале)
+        auto_mod_result = auto_moderate_content(photo_hash, file_size, sanitize_caption(caption), user_id, conn)
+        conn.close()
+        
+        if not auto_mod_result['approved']:
+            warning_text = "⚠️ Автомодерация обнаружила проблемы:\n\n"
+            warning_text += "\n".join([f"• {issue}" for issue in auto_mod_result['issues']])
+            warning_text += f"\n\nУверенность: {auto_mod_result['confidence']}%"
+            await update.message.reply_text(warning_text)
+            return
+        
+        if auto_mod_result['warnings']:
+            warning_text = "⚠️ Предупреждения:\n\n"
+            warning_text += "\n".join([f"• {w}" for w in auto_mod_result['warnings']])
+            await update.message.reply_text(warning_text)
+    except Exception as e:
+        logger.error(f"Error in auto-moderation: {e}")
     
     context.user_data['photo_file_id'] = photo.file_id
     context.user_data['photo_caption'] = caption
@@ -543,7 +793,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )])
         
         # Сохраняем соответствие короткого ID и полного
-        context.user_data['channel_mapping'] = {str(hash(ch[0]))[-8:]: ch[0] for ch in matched_channels}
+        context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in matched_channels}
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -667,12 +917,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         settings = get_channel_settings(channel_id)
+        smart_mode = "🤖 AI" if settings.get('smart_mode', False) else "📅 Простой"
+        automod = "✅ ON" if settings.get('auto_moderation', False) else "❌ OFF"
+        
         keyboard = [
             [InlineKeyboardButton(f"⏱ Интервал: {settings['interval']} мин", callback_data=f"cfg_interval_{short_channel_id}")],
             [InlineKeyboardButton(f"📊 Лимит: {settings['max_posts']} постов/день", callback_data=f"cfg_limit_{short_channel_id}")],
             [InlineKeyboardButton(f"📝 Подпись: {'required' if settings['require_caption'] else 'optional'}", callback_data=f"cfg_caption_{short_channel_id}")],
             [InlineKeyboardButton(f"🚫 Спам-фильтр: {'ON' if settings['spam_filter'] else 'OFF'}", callback_data=f"cfg_spam_{short_channel_id}")],
-            [InlineKeyboardButton(f"🌐 Общие мемы: {'ON' if settings.get('allow_global', True) else 'OFF'}", callback_data=f"cfg_global_{short_channel_id}")]
+            [InlineKeyboardButton(f"🌐 Общие мемы: {'ON' if settings.get('allow_global', True) else 'OFF'}", callback_data=f"cfg_global_{short_channel_id}")],
+            [InlineKeyboardButton(f"🤖 Планирование: {smart_mode}", callback_data=f"cfg_smartmode_{short_channel_id}")],
+            [InlineKeyboardButton(f"🛡️ Автомодерация: {automod}", callback_data=f"cfg_automod_{short_channel_id}")],
+            [InlineKeyboardButton("📊 Аналитика", callback_data=f"cfg_analytics_{short_channel_id}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("⚙️ Настройки канала:", reply_markup=reply_markup)
@@ -731,6 +987,63 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data=f"set_{short_channel_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(f"✅ Общие мемы теперь {'ON' if new_value else 'OFF'}\n\n{'Канал будет получать мемы, отправленные во все каналы' if new_value else 'Канал не будет получать мемы, отправленные во все каналы'}", reply_markup=reply_markup)
+        elif setting_type == "smartmode":
+            settings = get_channel_settings(channel_id)
+            current_mode = settings.get('smart_mode', False)
+            keyboard = [
+                [InlineKeyboardButton("📅 Простой режим", callback_data=f"sms_simple_{short_channel_id}")],
+                [InlineKeyboardButton("🤖 AI (Conservative)", callback_data=f"sms_conservative_{short_channel_id}")],
+                [InlineKeyboardButton("🤖 AI (Medium)", callback_data=f"sms_medium_{short_channel_id}")],
+                [InlineKeyboardButton("🤖 AI (Aggressive)", callback_data=f"sms_aggressive_{short_channel_id}")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"set_{short_channel_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            mode_text = "🤖 AI" if current_mode else "📅 Простой"
+            await query.edit_message_text(
+                f"🤖 Текущий режим: {mode_text}\n\n"
+                f"📅 Простой: публикация через N минут\n"
+                f"🤖 AI: умное планирование на основе:\n"
+                f"  • Размер очереди\n"
+                f"  • Лучшее время (по реакциям)\n"
+                f"  • День недели\n"
+                f"  • Избегание перегрузки\n\n"
+                f"Выберите режим:",
+                reply_markup=reply_markup
+            )
+        elif setting_type == "automod":
+            settings = get_channel_settings(channel_id)
+            new_value = not settings.get('auto_moderation', False)
+            update_channel_setting(channel_id, 'auto_moderation', new_value)
+            await query.answer(f"✅ Автомодерация {'ON' if new_value else 'OFF'}")
+            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data=f"set_{short_channel_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"✅ Автомодерация: {'ON' if new_value else 'OFF'}\n\n"
+                f"{'🛡️ Проверяется:\n• Дубликаты мемов\n• Качество изображения\n• Спам и реклама\n• Частота отправки' if new_value else '❌ Автоматическая проверка отключена'}",
+                reply_markup=reply_markup
+            )
+        elif setting_type == "analytics":
+            conn = get_db_connection()
+            growth = get_growth_stats(channel_id, conn)
+            approval = get_approval_rate(channel_id, conn)
+            top_authors = get_top_authors(channel_id, conn, 3)
+            analytics_data = get_channel_analytics(channel_id, conn)
+            conn.close()
+            
+            response = f"📊 Аналитика канала:\n\n"
+            response += f"📈 Рост за неделю:\n"
+            response += f"📊 Постов: {growth['posts_week']} ({growth['posts_growth']:+.1f}%)\n\n"
+            response += f"✅ Одобрение: {approval['rate']:.1f}%\n"
+            response += f"📋 Очередь: {analytics_data['queue_size']} постов\n\n"
+            
+            if top_authors:
+                response += "🏆 Топ-3 автора:\n"
+                for idx, (uid, uname, posts) in enumerate(top_authors, 1):
+                    response += f"{idx}. @{uname} - {posts} постов\n"
+            
+            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data=f"set_{short_channel_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(response, reply_markup=reply_markup)
     
     elif action == "sav":
         setting_type = data_parts[1]
@@ -834,6 +1147,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(response)
     
+    elif action == "sms":
+        # Сохранение режима планирования
+        mode = data_parts[1]
+        short_channel_id = data_parts[2]
+        channel_mapping = context.user_data.get('channel_mapping', {})
+        channel_id = channel_mapping.get(short_channel_id)
+        
+        if mode == "simple":
+            update_channel_setting(channel_id, 'smart_mode', False)
+            await query.answer("✅ Простой режим")
+            await query.edit_message_text("✅ Установлен простой режим планирования")
+        else:
+            update_channel_setting(channel_id, 'smart_mode', True)
+            update_channel_setting(channel_id, 'aggressiveness', mode)
+            await query.answer(f"✅ AI-режим ({mode})")
+            await query.edit_message_text(f"✅ Установлен AI-режим ({mode})\n\nПубликации будут планироваться автоматически")
+    
     elif action == "top":
         short_channel_id = data_parts[1]
         channel_mapping = context.user_data.get('channel_mapping', {})
@@ -860,10 +1190,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for idx, (user_id, username, posts, reactions) in enumerate(leaders, 1):
             medal = medals[idx-1] if idx <= 3 else f"{idx}."
-            response += f"{medal} @{username}\n"
+            rank = get_user_rank(posts)
+            response += f"{medal} @{username} {rank}\n"
             response += f"   📊 Мемов: {posts} | 👍 Реакций: {reactions}\n\n"
         
         await query.edit_message_text(response)
+    
+    elif action == "buy":
+        item_type = data_parts[1]
+        user_id = query.from_user.id
+        username = query.from_user.username or query.from_user.first_name
+        
+        costs = {'priority': 50, 'skip': 100, 'pin': 200}
+        cost = costs.get(item_type, 0)
+        
+        if buy_shop_item(user_id, username, item_type, cost, 24):
+            await query.answer("✅ Куплено!")
+            await query.edit_message_text(f"✅ Вы купили {item_type} за {cost} монет!")
+        else:
+            await query.answer("❌ Недостаточно монет!")
     
     elif action in ["app", "rej", "ban", "next"]:
         # Админ модерирует пост
@@ -922,6 +1267,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await show_next_post(query, context, channel_id)
                         return
                 
+                # ФАЗА 4: Умное планирование
+                settings = get_channel_settings(channel_id)
+                from datetime import datetime, timedelta
+                
+                if settings.get('smart_mode', False):
+                    conn = get_db_connection()
+                    next_time = calculate_smart_schedule(channel_id, conn, settings.get('aggressiveness', 'medium'))
+                    conn.close()
+                    
+                    if next_time > datetime.now():
+                        add_scheduled_post(channel_id, user_id, username, photo_file_id, caption, next_time)
+                        remove_pending_post(post_id)
+                        log_action(channel_id, 'smart_scheduled', user_id, query.from_user.id, post_id, f"Scheduled for {next_time}")
+                        await query.answer(f"🤖 Умное планирование: {next_time.strftime('%H:%M %d.%m')}")
+                        await show_next_post(query, context, channel_id)
+                        return
+                
                 msg = await context.bot.send_photo(
                     chat_id=channel_id,
                     photo=photo_file_id,
@@ -929,6 +1291,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 
                 add_published_post(channel_id, user_id, username, msg.message_id)
+                add_coins(user_id, username, 10, "Мем опубликован")
+                update_streak(user_id, username)
+                check_daily_quests(user_id, username)
+                
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
+                posts_count = cur.fetchone()[0]
+                cur.close()
+                conn.close()
+                
+                achievements = check_and_award_achievements(user_id, username, posts_count)
+                rank = get_user_rank(posts_count)
+                
                 update_channel_setting(channel_id, 'last_post_time', datetime.now())
                 remove_pending_post(post_id)
                 log_action(channel_id, 'published', user_id, query.from_user.id, post_id)
@@ -939,10 +1315,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except:
                     channel_name = "канале"
                 
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"🎉 Ваш контент опубликован в {channel_name}!"
-                )
+                notif = f"🎉 Ваш контент опубликован в {channel_name}!\n💰 +10 мемкоинов\n{rank} | Мемов: {posts_count}"
+                if achievements:
+                    notif += "\n\n🏆 " + "\n🏆 ".join(achievements)
+                
+                await context.bot.send_message(chat_id=user_id, text=notif)
                 
                 await show_next_post(query, context, channel_id)
                 
@@ -1004,6 +1381,10 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     channel_id = context.args[0]
+    
+    if not validate_channel_id(channel_id):
+        await update.message.reply_text("❌ Неверный формат ID канала!\n\nИспользуйте @username или -100XXXXXXXXXX")
+        return
     
     try:
         chat = await context.bot.get_chat(channel_id)
@@ -1171,10 +1552,10 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channel_name = chat.title
             except:
                 channel_name = ch_id
-            short_channel_id = str(hash(ch_id))[-8:]
+            short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
             keyboard.append([InlineKeyboardButton(f"⚙️ {channel_name}", callback_data=f"set_{short_channel_id}")])
         
-        context.user_data['channel_mapping'] = {str(hash(ch[0]))[-8:]: ch[0] for ch in [(ch,) for ch in user_channels]}
+        context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text("⚙️ Выберите канал для настройки:", reply_markup=reply_markup)
         return
@@ -1238,10 +1619,10 @@ async def audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             channel_name = chat.title
         except:
             channel_name = ch_id
-        short_channel_id = str(hash(ch_id))[-8:]
+        short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
         keyboard.append([InlineKeyboardButton(f"📊 {channel_name}", callback_data=f"aud_{short_channel_id}")])
     
-    context.user_data['channel_mapping'] = {str(hash(ch[0]))[-8:]: ch[0] for ch in [(ch,) for ch in user_channels]}
+    context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("📊 Выберите канал для просмотра истории:", reply_markup=reply_markup)
 
@@ -1262,13 +1643,13 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             channel_name = ch_id
         
-        short_channel_id = str(hash(ch_id))[-8:]
+        short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
         keyboard.append([InlineKeyboardButton(
             f"📢 {channel_name}",
             callback_data=f"ubc_{short_channel_id}"
         )])
     
-    context.user_data['channel_mapping'] = {str(hash(ch[0]))[-8:]: ch[0] for ch in [(ch,) for ch in user_channels]}
+    context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("🚫 Выберите канал для разблокировки пользователей:", reply_markup=reply_markup)
 
@@ -1364,7 +1745,8 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for idx, (user_id, username, posts, reactions) in enumerate(leaders, 1):
             medal = medals[idx-1] if idx <= 3 else f"{idx}."
-            response += f"{medal} @{username}\n"
+            rank = get_user_rank(posts)
+            response += f"{medal} @{username} {rank}\n"
             response += f"   📊 Мемов: {posts} | 👍 Реакций: {reactions}\n\n"
         
         await update.message.reply_text(response)
@@ -1388,15 +1770,183 @@ async def topchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             channel_name = ch_id
         
-        short_channel_id = str(hash(ch_id))[-8:]
+        short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
         keyboard.append([InlineKeyboardButton(
             f"🏆 {channel_name}",
             callback_data=f"top_{short_channel_id}"
         )])
     
-    context.user_data['channel_mapping'] = {str(hash(ch[0]))[-8:]: ch[0] for ch in [(ch,) for ch in user_channels]}
+    context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("🏆 Выберите канал для просмотра таблицы лидеров:", reply_markup=reply_markup)
+
+async def mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
+        published = cur.fetchone()[0]
+        
+        cur.execute("SELECT COUNT(*) FROM audit_log WHERE user_id = %s AND action = 'rejected'", (user_id,))
+        rejected = cur.fetchone()[0]
+        
+        cur.execute("SELECT COUNT(*) FROM pending_posts WHERE user_id = %s", (user_id,))
+        pending = cur.fetchone()[0]
+        
+        cur.execute("SELECT COALESCE(SUM(reactions), 0) FROM published_posts WHERE user_id = %s", (user_id,))
+        total_reactions = cur.fetchone()[0]
+        
+        balance, total_earned = get_user_balance(user_id)
+        current_streak, longest_streak = get_streak(user_id)
+        
+        total_sent = published + rejected + pending
+        approval_rate = (published / total_sent * 100) if total_sent > 0 else 0
+        
+        leaders = get_global_leaderboard(100)
+        position = None
+        for idx, (uid, uname, posts, reactions) in enumerate(leaders, 1):
+            if uid == user_id:
+                position = idx
+                break
+        
+        cur.close()
+        conn.close()
+        
+        rank = get_user_rank(published)
+        
+        response = f"📊 Статистика @{username}\n\n"
+        response += f"{rank} | Мемов: {published}\n"
+        response += f"💰 Мемкоины: {balance}\n"
+        response += f"🔥 Стрик: {current_streak} дней (рекорд: {longest_streak})\n\n"
+        response += f"📤 Отправлено: {total_sent}\n"
+        response += f"✅ Опубликовано: {published}\n"
+        response += f"❌ Отклонено: {rejected}\n"
+        response += f"⏳ На модерации: {pending}\n"
+        response += f"💯 Одобрение: {approval_rate:.1f}%\n"
+        response += f"👍 Реакций: {total_reactions}\n\n"
+        
+        if position:
+            response += f"🏆 Позиция: #{position}"
+        else:
+            response += "🏆 Позиция: не в топ-100"
+        
+        await update.message.reply_text(response)
+    except Exception as e:
+        logger.error(f"Error in mystats: {e}")
+        await update.message.reply_text("❌ Ошибка получения статистики.")
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    try:
+        balance, total_earned = get_user_balance(user_id)
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT amount, reason, created_at FROM coin_transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT 10", (user_id,))
+        transactions = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        response = f"💰 Баланс @{username}\n\n"
+        response += f"💵 Текущий баланс: {balance} монет\n"
+        response += f"📈 Всего заработано: {total_earned} монет\n\n"
+        
+        if transactions:
+            response += "📜 Последние транзакции:\n"
+            for amount, reason, created_at in transactions:
+                sign = "+" if amount > 0 else ""
+                response += f"{sign}{amount} - {reason} ({created_at.strftime('%d.%m %H:%M')})\n"
+        else:
+            response += "📜 Транзакций пока нет"
+        
+        await update.message.reply_text(response)
+    except Exception as e:
+        logger.error(f"Error in balance: {e}")
+        await update.message.reply_text("❌ Ошибка получения баланса.")
+
+async def quests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    check_daily_quests(user_id, username)
+    quests = get_daily_quests(user_id)
+    
+    response = "📋 Ежедневные задания:\n\n"
+    
+    quest_names = {
+        'post_1': '📤 Отправить 1 мем',
+        'reactions_50': '👍 Получить 50 реакций'
+    }
+    
+    for quest_type, completed, reward in quests:
+        status = "✅" if completed else "⏳"
+        name = quest_names.get(quest_type, quest_type)
+        response += f"{status} {name} (+{reward} монет)\n"
+    
+    if not quests:
+        response += "Заданий пока нет. Отправьте мем!"
+    
+    await update.message.reply_text(response)
+
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    balance, _ = get_user_balance(user_id)
+    
+    keyboard = [
+        [InlineKeyboardButton("⚡ Приоритет (50 монет)", callback_data="buy_priority")],
+        [InlineKeyboardButton("🎫 Пропуск модерации (100 монет)", callback_data="buy_skip")],
+        [InlineKeyboardButton("📌 Закрепить пост (200 монет)", callback_data="buy_pin")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"🛒 Магазин привилегий\n\n"
+        f"💰 Ваш баланс: {balance} монет\n\n"
+        f"⚡ Приоритет - ваш мем будет модерироваться первым\n"
+        f"🎫 Пропуск - мем публикуется без модерации\n"
+        f"📌 Закрепить - пост будет закреплен на 24ч",
+        reply_markup=reply_markup
+    )
+
+async def weekwinner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import date, timedelta
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    
+    cur.execute(
+        "SELECT user_id, username, COUNT(*) as posts, COALESCE(SUM(reactions), 0) as reactions "
+        "FROM published_posts WHERE DATE(published_at) >= %s "
+        "GROUP BY user_id, username ORDER BY reactions DESC LIMIT 1",
+        (week_start,)
+    )
+    winner = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    if not winner:
+        await update.message.reply_text("⭐ Мем недели еще не определен!")
+        return
+    
+    user_id, username, posts, reactions = winner
+    rank = get_user_rank(posts)
+    
+    await update.message.reply_text(
+        f"⭐ Мем недели\n\n"
+        f"🏆 Победитель: @{username}\n"
+        f"{rank}\n"
+        f"📊 Мемов: {posts}\n"
+        f"👍 Реакций: {reactions}\n\n"
+        f"Новый победитель будет объявлен в понедельник!"
+    )
 
 async def manual_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPPORT_ADMIN_ID:
@@ -1435,6 +1985,147 @@ async def manual_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error updating reactions: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
+
+# ФАЗА 4: Функции автоматизации
+def auto_moderate_content(photo_hash: str, file_size: int, caption: str, user_id: int, conn):
+    result = {'approved': True, 'confidence': 100, 'issues': [], 'warnings': []}
+    spam_keywords = ['реклама', 'заработок', 'казино', 'ставки', 'кредит', 'займ']
+    caption_lower = sanitize_caption(caption).lower()
+    if any(keyword in caption_lower for keyword in spam_keywords):
+        result['approved'] = False
+        result['issues'].append('Обнаружен спам')
+    return result
+
+def get_channel_analytics(channel_id: str, conn):
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM pending_posts WHERE channel_id = %s", (channel_id,))
+    queue_size = cur.fetchone()[0]
+    cur.close()
+    return {'queue_size': queue_size}
+
+def calculate_smart_schedule(channel_id: str, conn, aggressiveness: str = 'medium'):
+    from datetime import datetime, timedelta
+    analytics = get_channel_analytics(channel_id, conn)
+    now = datetime.now()
+    base_intervals = {'conservative': 180, 'medium': 90, 'aggressive': 45}
+    base_interval = base_intervals.get(aggressiveness, 90)
+    if analytics['queue_size'] > 10:
+        base_interval = max(30, base_interval - 20)
+    elif analytics['queue_size'] < 3:
+        base_interval += 30
+    next_time = now + timedelta(minutes=base_interval)
+    if 1 <= next_time.hour < 7:
+        next_time = next_time.replace(hour=9, minute=0)
+        if next_time < now:
+            next_time += timedelta(days=1)
+    return next_time
+
+def get_approval_rate(channel_id: str, conn):
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM audit_log WHERE channel_id = %s AND action = 'published'", (channel_id,))
+    published = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM audit_log WHERE channel_id = %s AND action = 'rejected'", (channel_id,))
+    rejected = cur.fetchone()[0]
+    cur.close()
+    total = published + rejected
+    rate = (published / total * 100) if total > 0 else 0
+    return {'published': published, 'rejected': rejected, 'total': total, 'rate': rate}
+
+def get_top_authors(channel_id: str, conn, limit: int = 10):
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, username, COUNT(*) as posts FROM published_posts WHERE channel_id = %s GROUP BY user_id, username ORDER BY posts DESC LIMIT %s", (channel_id, limit))
+    result = cur.fetchall()
+    cur.close()
+    return result
+
+def get_growth_stats(channel_id: str, conn):
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM published_posts WHERE channel_id = %s AND published_at > NOW() - INTERVAL '7 days'", (channel_id,))
+    posts_week = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM published_posts WHERE channel_id = %s AND published_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days'", (channel_id,))
+    posts_prev_week = cur.fetchone()[0]
+    cur.close()
+    posts_growth = ((posts_week - posts_prev_week) / posts_prev_week * 100) if posts_prev_week > 0 else 0
+    return {'posts_week': posts_week, 'posts_prev_week': posts_prev_week, 'posts_growth': posts_growth}
+
+async def lootbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import random
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
+    posts = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM lootboxes WHERE user_id = %s AND opened = FALSE", (user_id,))
+    available = cur.fetchone()[0]
+    earned = posts // 10
+    cur.execute("SELECT COUNT(*) FROM lootboxes WHERE user_id = %s", (user_id,))
+    total = cur.fetchone()[0]
+    if earned > total:
+        for _ in range(earned - total):
+            cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (%s, %s, 'standard')", (user_id, username))
+        conn.commit()
+        available = earned - total
+    if available == 0:
+        await update.message.reply_text(f"📦 Нет лутбоксов!\n\nОпубликуйте {10 - (posts % 10)} мемов для следующего.")
+        cur.close()
+        conn.close()
+        return
+    cur.execute("SELECT id FROM lootboxes WHERE user_id = %s AND opened = FALSE LIMIT 1", (user_id,))
+    box_id = cur.fetchone()[0]
+    roll = random.random()
+    reward = 500 if roll < 0.01 else 200 if roll < 0.10 else random.randint(20, 100)
+    cur.execute("INSERT INTO lootbox_rewards (lootbox_id, reward_type, reward_value) VALUES (%s, 'coins', %s)", (box_id, reward))
+    cur.execute("UPDATE lootboxes SET opened = TRUE WHERE id = %s", (box_id,))
+    conn.commit()
+    add_coins(user_id, username, reward, "🎁 Лутбокс")
+    cur.close()
+    conn.close()
+    await update.message.reply_text(f"🎁 Лутбокс открыт!\n\n💰 +{reward} монет\n📦 Осталось: {available - 1}")
+
+async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime
+    user_id = update.effective_user.id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT code FROM referral_codes WHERE user_id = %s", (user_id,))
+    result = cur.fetchone()
+    if not result:
+        code = hashlib.sha256(f"{user_id}{datetime.now()}".encode()).hexdigest()[:8]
+        cur.execute("INSERT INTO referral_codes (user_id, code) VALUES (%s, %s)", (user_id, code))
+        conn.commit()
+    else:
+        code = result[0]
+    cur.execute("SELECT total_referrals FROM referral_codes WHERE user_id = %s", (user_id,))
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND reward_claimed = TRUE", (user_id,))
+    rewarded = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    bot_username = (await context.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start=ref_{code}"
+    await update.message.reply_text(f"🎁 Реферальная программа\n\n👥 Приглашено: {total}\n💰 Награды: {rewarded}\n\n🔗 Ваша ссылка:\n{link}\n\n💵 +100 монет за друга\n💵 +50 когда друг опубликует 5 мемов")
+
+async def rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT avg_rating, total_ratings FROM user_ratings WHERE user_id = %s", (user_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not result or result[1] == 0:
+        await update.message.reply_text("⭐ Нет рейтинга\n\nОпубликуйте мемы для оценки!")
+        return
+    avg, total = result
+    stars = "⭐" * int(avg)
+    response = f"⭐ Рейтинг @{username}\n\n{stars} {avg:.2f}/5.00\n📊 Оценок: {total}\n\n"
+    if avg >= 4.5:
+        response += "🏆 Отличный рейтинг! +10% монет"
+    elif avg < 2.0 and total >= 10:
+        response += "⚠️ Низкий рейтинг. Улучшите качество!"
+    await update.message.reply_text(response)
 
 async def post_init(application: Application):
     # Создаем таблицу для очереди постов
@@ -1535,6 +2226,33 @@ async def post_init(application: Application):
             )
         """)
         
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_coins (
+                user_id BIGINT PRIMARY KEY,
+                username VARCHAR(255),
+                balance INTEGER DEFAULT 0,
+                total_earned INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS coin_transactions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                amount INTEGER,
+                reason VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_user ON coin_transactions(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_published_posts_user ON published_posts(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_published_posts_channel ON published_posts(channel_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_posts_channel ON pending_posts(channel_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_channel ON audit_log(channel_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_banned_users_user ON banned_users(user_id)")
+        
         conn.commit()
         cur.close()
         conn.close()
@@ -1544,16 +2262,24 @@ async def post_init(application: Application):
     
     commands = [
         BotCommand("start", "Начать работу с ботом"),
+        BotCommand("mystats", "Моя статистика"),
+        BotCommand("balance", "Мой баланс мемкоинов"),
+        BotCommand("quests", "Ежедневные задания"),
+        BotCommand("shop", "Магазин привилегий"),
+        BotCommand("lootbox", "Открыть лутбокс"),
+        BotCommand("referral", "Реферальная программа"),
+        BotCommand("rating", "Мой рейтинг"),
+        BotCommand("weekwinner", "Мем недели"),
+        BotCommand("leaderboard", "Таблица лидеров"),
         BotCommand("moderate", "Модерация постов"),
         BotCommand("addchannel", "Добавить канал"),
-        BotCommand("settings", "Настройки канала"),
+        BotCommand("settings", "Настройки (Аналитика, AI)"),
         BotCommand("queue", "Очередь постов"),
         BotCommand("audit", "История действий"),
-        BotCommand("unban", "Разблокировать пользователя"),
+        BotCommand("unban", "Разблокировать"),
         BotCommand("channels", "Список каналов"),
         BotCommand("stats", "Статистика"),
-        BotCommand("leaderboard", "Глобальная таблица лидеров"),
-        BotCommand("topchannel", "Таблица лидеров канала"),
+        BotCommand("topchannel", "Топ канала"),
         BotCommand("support", "Техподдержка")
     ]
     await application.bot.set_my_commands(commands)
@@ -1606,16 +2332,30 @@ async def publish_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
                 caption=caption if caption else None
             )
             add_published_post(channel_id, user_id, username, msg.message_id)
+            add_coins(user_id, username, 10, "Мем опубликован")
+            update_streak(user_id, username)
+            check_daily_quests(user_id, username)
+            
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
+            posts_count = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            
+            achievements = check_and_award_achievements(user_id, username, posts_count)
+            rank = get_user_rank(posts_count)
+            
             update_channel_setting(channel_id, 'last_post_time', datetime.now())
             remove_scheduled_post(post_id)
             log_action(channel_id, 'auto_published', user_id, 0, post_id, 'Published by scheduler')
             logger.info(f"[SCHEDULER] Successfully published post {post_id}")
             
             try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"🎉 Ваш контент опубликован!"
-                )
+                notif = f"🎉 Ваш контент опубликован!\n💰 +10 мемкоинов\n{rank} | Мемов: {posts_count}"
+                if achievements:
+                    notif += "\n\n🏆 " + "\n🏆 ".join(achievements)
+                await context.bot.send_message(chat_id=user_id, text=notif)
             except:
                 pass
             
@@ -1635,6 +2375,14 @@ async def start_bot():
         logger.warning("JobQueue не доступен. Установите: pip install python-telegram-bot[job-queue]")
     
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("mystats", mystats))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("quests", quests))
+    application.add_handler(CommandHandler("shop", shop))
+    application.add_handler(CommandHandler("lootbox", lootbox))
+    application.add_handler(CommandHandler("referral", referral))
+    application.add_handler(CommandHandler("rating", rating))
+    application.add_handler(CommandHandler("weekwinner", weekwinner))
     application.add_handler(CommandHandler("moderate", moderate))
     application.add_handler(CommandHandler("addchannel", addchannel))
     application.add_handler(CommandHandler("settings", settings))
