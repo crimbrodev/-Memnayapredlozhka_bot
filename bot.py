@@ -1992,6 +1992,30 @@ async def weekwinner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Новый победитель будет объявлен в понедельник!"
     )
 
+async def updatemenu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPPORT_ADMIN_ID:
+        await update.message.reply_text("❌ Эта команда доступна только администратору.")
+        return
+    
+    try:
+        commands = [
+            BotCommand("start", "Начать работу с ботом"),
+            BotCommand("mystats", "Моя статистика"),
+            BotCommand("balance", "Мой баланс мемкоинов"),
+            BotCommand("quests", "Ежедневные задания"),
+            BotCommand("shop", "Магазин привилегий"),
+            BotCommand("lootbox", "Открыть лутбокс"),
+            BotCommand("referral", "Реферальная программа"),
+            BotCommand("weekwinner", "Мем недели"),
+            BotCommand("leaderboard", "Таблица лидеров"),
+            BotCommand("admin", "Панель администратора"),
+            BotCommand("support", "Техподдержка")
+        ]
+        await context.bot.set_my_commands(commands)
+        await update.message.reply_text("✅ Меню команд обновлено!\n\nПерезапустите Telegram или отправьте /start для применения изменений.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 async def manual_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPPORT_ADMIN_ID:
         return
@@ -2443,6 +2467,7 @@ async def start_bot():
     application.add_handler(CommandHandler("leaderboard", leaderboard))
     application.add_handler(CommandHandler("topchannel", topchannel))
     application.add_handler(CommandHandler("update", manual_update))
+    application.add_handler(CommandHandler("updatemenu", updatemenu))
     application.add_handler(CommandHandler("support", support))
     application.add_handler(CommandHandler("reply", reply_support))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
