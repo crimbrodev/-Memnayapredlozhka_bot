@@ -4,6 +4,8 @@ import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.error import TelegramError
+from aiohttp import web
+import asyncio
 
 # Загружаем переменные из .env файла
 try:
@@ -1621,11 +1623,10 @@ async def publish_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"[SCHEDULER] Error publishing post {post_id}: {e}")
 
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не установлен!")
-        return
-    
+async def health(request):
+    return web.Response(text="OK")
+
+async def start_bot():
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
     if application.job_queue:
@@ -1651,8 +1652,35 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(button_callback))
     
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
     logger.info("Бот запущен!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    return application
+
+def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN не установлен!")
+        return
+    
+    app = web.Application()
+    app.router.add_get('/', health)
+    app.router.add_get('/health', health)
+    
+    async def start_services(app):
+        app['bot'] = await start_bot()
+    
+    async def cleanup(app):
+        if 'bot' in app:
+            await app['bot'].updater.stop()
+            await app['bot'].stop()
+            await app['bot'].shutdown()
+    
+    app.on_startup.append(start_services)
+    app.on_cleanup.append(cleanup)
+    
+    port = int(os.getenv('PORT', 10000))
+    web.run_app(app, host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
     main()
