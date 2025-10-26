@@ -822,31 +822,211 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "adm":
         admin_action = data_parts[1]
         if admin_action == "moderate":
-            await moderate(query, context)
+            user_id = query.from_user.id
+            user_channels = get_user_channels(user_id)
+            
+            if not user_channels:
+                await query.edit_message_text("❌ Вы не являетесь администратором ни одного канала.")
+                return
+            
+            keyboard = []
+            for ch_id in user_channels:
+                try:
+                    chat = await context.bot.get_chat(ch_id)
+                    channel_name = chat.title
+                except:
+                    channel_name = ch_id
+                
+                pending_count = len(get_pending_posts(ch_id))
+                short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
+                keyboard.append([InlineKeyboardButton(
+                    f"📢 {channel_name} ({pending_count} постов)", 
+                    callback_data=f"mod_{short_channel_id}"
+                )])
+            
+            context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("🛡️ Выберите канал для модерации:", reply_markup=reply_markup)
             return
         elif admin_action == "addchannel":
             await query.edit_message_text("➕ Используйте: /addchannel <channel_id>\n\nПример: /addchannel @mychannel")
             return
         elif admin_action == "settings":
-            await settings(query, context)
+            user_id = query.from_user.id
+            user_channels = get_user_channels(user_id)
+            
+            if not user_channels:
+                await query.edit_message_text("❌ Вы не являетесь администратором ни одного канала.")
+                return
+            
+            keyboard = []
+            for ch_id in user_channels:
+                try:
+                    chat = await context.bot.get_chat(ch_id)
+                    channel_name = chat.title
+                except:
+                    channel_name = ch_id
+                short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
+                keyboard.append([InlineKeyboardButton(f"⚙️ {channel_name}", callback_data=f"set_{short_channel_id}")])
+            
+            context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("⚙️ Выберите канал для настройки:", reply_markup=reply_markup)
             return
         elif admin_action == "stats":
-            await stats(query, context)
+            user_id = query.from_user.id
+            user_channels = get_user_channels(user_id)
+            
+            if not user_channels:
+                await query.edit_message_text("❌ Вы не являетесь администратором ни одного канала.")
+                return
+            
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                placeholders = ','.join(['%s'] * len(user_channels))
+                cur.execute(f"SELECT COUNT(*) FROM pending_posts WHERE channel_id IN ({placeholders})", user_channels)
+                pending_count = cur.fetchone()[0]
+                cur.execute(f"SELECT COUNT(*) FROM banned_users WHERE channel_id IN ({placeholders})", user_channels)
+                banned_count = cur.fetchone()[0]
+                cur.execute(f"SELECT COUNT(*) FROM audit_log WHERE channel_id IN ({placeholders}) AND action = 'published'", user_channels)
+                published_count = cur.fetchone()[0]
+                cur.close()
+                conn.close()
+                
+                await query.edit_message_text(
+                    f"📊 Статистика ваших каналов:\n\n"
+                    f"📢 Каналов: {len(user_channels)}\n"
+                    f"✅ Опубликовано: {published_count}\n"
+                    f"⏳ В очереди: {pending_count}\n"
+                    f"🚫 Забанено: {banned_count}"
+                )
+            except Exception as e:
+                logger.error(f"Error in stats: {e}")
+                await query.edit_message_text("❌ Ошибка получения статистики.")
             return
         elif admin_action == "queue":
-            await queue(query, context)
+            user_id = query.from_user.id
+            user_channels = get_user_channels(user_id)
+            
+            if not user_channels:
+                await query.edit_message_text("❌ Вы не являетесь администратором ни одного канала.")
+                return
+            
+            response = "📅 Запланированные посты:\n\n"
+            has_posts = False
+            
+            for ch_id in user_channels:
+                scheduled = get_scheduled_posts(ch_id)
+                if scheduled:
+                    has_posts = True
+                    try:
+                        chat = await context.bot.get_chat(ch_id)
+                        response += f"📢 {chat.title}:\n"
+                    except:
+                        response += f"📢 {ch_id}:\n"
+                    
+                    for post in scheduled:
+                        post_id, _, _, username, _, _, scheduled_time = post
+                        response += f"  • От @{username} → {scheduled_time.strftime('%H:%M %d.%m')}\n"
+            
+            if not has_posts:
+                response += "✅ Нет запланированных постов"
+            
+            await query.edit_message_text(response)
             return
         elif admin_action == "audit":
-            await audit(query, context)
+            user_id = query.from_user.id
+            user_channels = get_user_channels(user_id)
+            
+            if not user_channels:
+                await query.edit_message_text("❌ Вы не являетесь администратором ни одного канала.")
+                return
+            
+            keyboard = []
+            for ch_id in user_channels:
+                try:
+                    chat = await context.bot.get_chat(ch_id)
+                    channel_name = chat.title
+                except:
+                    channel_name = ch_id
+                short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
+                keyboard.append([InlineKeyboardButton(f"📊 {channel_name}", callback_data=f"aud_{short_channel_id}")])
+            
+            context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("📊 Выберите канал для просмотра истории:", reply_markup=reply_markup)
             return
         elif admin_action == "unban":
-            await unban(query, context)
+            user_id = query.from_user.id
+            user_channels = get_user_channels(user_id)
+            
+            if not user_channels:
+                await query.edit_message_text("❌ Эта команда доступна только администраторам.")
+                return
+            
+            keyboard = []
+            for ch_id in user_channels:
+                try:
+                    chat = await context.bot.get_chat(ch_id)
+                    channel_name = chat.title
+                except:
+                    channel_name = ch_id
+                
+                short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
+                keyboard.append([InlineKeyboardButton(
+                    f"📢 {channel_name}",
+                    callback_data=f"ubc_{short_channel_id}"
+                )])
+            
+            context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("🚫 Выберите канал для разблокировки пользователей:", reply_markup=reply_markup)
             return
         elif admin_action == "channels":
-            await channels(query, context)
+            user_id = query.from_user.id
+            user_channels = get_user_channels(user_id)
+            
+            if not user_channels:
+                await query.edit_message_text("📋 Вы не являетесь администратором ни одного канала.")
+                return
+            
+            response = "📋 Ваши каналы:\n\n"
+            for ch_id in user_channels:
+                try:
+                    chat = await context.bot.get_chat(ch_id)
+                    pending_count = len(get_pending_posts(ch_id))
+                    response += f"• {chat.title} ({pending_count} в очереди)\n"
+                except:
+                    response += f"• {ch_id}\n"
+            
+            await query.edit_message_text(response)
             return
         elif admin_action == "topchannel":
-            await topchannel(query, context)
+            user_id = query.from_user.id
+            user_channels = get_user_channels(user_id)
+            
+            if not user_channels:
+                await query.edit_message_text("❌ Вы не являетесь администратором ни одного канала.")
+                return
+            
+            keyboard = []
+            for ch_id in user_channels:
+                try:
+                    chat = await context.bot.get_chat(ch_id)
+                    channel_name = chat.title
+                except:
+                    channel_name = ch_id
+                
+                short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
+                keyboard.append([InlineKeyboardButton(
+                    f"🏆 {channel_name}",
+                    callback_data=f"top_{short_channel_id}"
+                )])
+            
+            context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("🏆 Выберите канал для просмотра таблицы лидеров:", reply_markup=reply_markup)
             return
     
     if action == "all":
