@@ -529,9 +529,9 @@ def use_shop_item(user_id: int, item_type: str, channel_id: str = None):
     conn = get_db_connection()
     cur = conn.cursor()
     if channel_id:
-        cur.execute("UPDATE shop_purchases SET used = TRUE WHERE user_id = %s AND item_type = %s AND channel_id = %s AND used = FALSE LIMIT 1", (user_id, item_type, channel_id))
+        cur.execute("UPDATE shop_purchases SET used = TRUE WHERE ctid = (SELECT ctid FROM shop_purchases WHERE user_id = %s AND item_type = %s AND channel_id = %s AND used = FALSE LIMIT 1)", (user_id, item_type, channel_id))
     else:
-        cur.execute("UPDATE shop_purchases SET used = TRUE WHERE user_id = %s AND item_type = %s AND used = FALSE LIMIT 1", (user_id, item_type))
+        cur.execute("UPDATE shop_purchases SET used = TRUE WHERE ctid = (SELECT ctid FROM shop_purchases WHERE user_id = %s AND item_type = %s AND used = FALSE LIMIT 1)", (user_id, item_type))
     conn.commit()
     cur.close()
     conn.close()
@@ -571,7 +571,7 @@ def has_channel_protection(user_id: int, channel_id: str):
 def use_channel_protection(user_id: int, channel_id: str):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE channel_protections SET used = TRUE WHERE user_id = %s AND channel_id = %s AND used = FALSE LIMIT 1", (user_id, channel_id))
+    cur.execute("UPDATE channel_protections SET used = TRUE WHERE ctid = (SELECT ctid FROM channel_protections WHERE user_id = %s AND channel_id = %s AND used = FALSE LIMIT 1)", (user_id, channel_id))
     conn.commit()
     cur.close()
     conn.close()
