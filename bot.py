@@ -715,6 +715,9 @@ async def show_next_post(query, context: ContextTypes.DEFAULT_TYPE, channel_id: 
         logger.error(f"Error editing media: {e}")
         try:
             await query.message.delete()
+        except:
+            pass
+        try:
             await context.bot.send_photo(
                 chat_id=query.message.chat_id,
                 photo=photo_file_id,
@@ -723,7 +726,14 @@ async def show_next_post(query, context: ContextTypes.DEFAULT_TYPE, channel_id: 
             )
         except Exception as e2:
             logger.error(f"Error sending new photo: {e2}")
-            await query.edit_message_text(caption_text, reply_markup=reply_markup)
+            try:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=caption_text,
+                    reply_markup=reply_markup
+                )
+            except Exception as e3:
+                logger.error(f"Error sending message: {e3}")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message:
