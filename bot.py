@@ -735,9 +735,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         return
     
-    # Проверяем привилегию "пропуск модерации" или VIP
-    sub = has_active_subscription(user_id)
-    if has_active_item(user_id, 'skip') or sub == 'vip':
+    # Проверяем только купленный пропуск (VIP не автопубликует)
+    if has_active_item(user_id, 'skip'):
         channels = get_channels_with_names()
         if channels:
             photo = update.message.photo[-1]
@@ -761,10 +760,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     update_channel_setting(channel_id, 'last_post_time', datetime.now())
                 except:
                     pass
-            if has_active_item(user_id, 'skip'):
-                use_shop_item(user_id, 'skip')
+            use_shop_item(user_id, 'skip')
             
             # Применяем бонусы подписки
+            sub = has_active_subscription(user_id)
             coin_bonus = 10
             if sub == 'vip':
                 coin_bonus = int(10 * 3)
@@ -826,19 +825,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['photo_caption'] = caption
     context.user_data['waiting_for_channel'] = True
     
-    # Проверяем привилегию приоритета или подписку
+    # Проверяем привилегии
     sub = has_active_subscription(user_id)
     if has_active_item(user_id, 'priority') or sub in ['basic', 'pro', 'vip']:
         context.user_data['has_priority'] = True
     
     keyboard = [
-        [InlineKeyboardButton("🌐 Отправить во все каналы", callback_data=f"all_{user_id}")]
+        [InlineKeyboardButton("🌐 Отправить во все каналы", callback_data=f"selectch_all_{user_id}")]
     ]
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         "📤 Напишите название или @username канала, в который хотите отправить контент:\n\n"
-        "Или нажмите кнопку ниже, чтобы отправить во все каналы сразу:",
+        "Или нажмите кнопку ниже:",
         reply_markup=reply_markup
     )
 
@@ -1049,7 +1049,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = context.user_data.get('photo_caption', '')
     
     if len(matched_channels) == 1:
-        # Найден только один канал - добавляем в очередь сразу
+        # Найден только один канал - переходим к выбору опций
         channel_id, channel_name, channel_username = matched_channels[0]
         
         if is_user_banned(user_id, channel_id):
@@ -1057,17 +1057,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['waiting_for_channel'] = False
             return
         
-        has_priority = context.user_data.get('has_priority', False)
-        if has_priority:
-            use_shop_item(user_id, 'priority')
-        add_pending_post(channel_id, user_id, username, photo_file_id, caption, has_priority)
-        
         context.user_data['waiting_for_channel'] = False
-        context.user_data['has_priority'] = False
+        context.user_data['selected_channels'] = [channel_id]
         
-        await update.message.reply_text(
-            f"✅ Ваш контент добавлен в очередь модерации канала '{channel_name}'!"
-        )
+        # Переходим к выбору опций
+        await ask_pin_option(update, context, user_id)
     else:
         # Найдено несколько каналов - показываем кнопки
         keyboard = []
@@ -1079,7 +1073,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             keyboard.append([InlineKeyboardButton(
                 f"📢 {display_name}", 
-                callback_data=f"sel_{user_id}_{short_channel_id}"
+                callback_data=f"selectch_{short_channel_id}_{user_id}"
             )])
         
         # Сохраняем соответствие короткого ID и полного
@@ -1091,6 +1085,158 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔍 Найдено {len(matched_channels)} канал(ов) с похожим названием.\nВыберите канал:",
             reply_markup=reply_markup
         )
+
+async def ask_pin_option(message_or_query, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Спрашивает, нужно ли закреплять пост"""
+    sub = has_active_subscription(user_id)
+    has_pin = has_active_item(user_id, 'pin') or sub == 'vip'
+    
+    if has_pin:
+        keyboard = [
+            [InlineKeyboardButton("📌 Да, закрепить", callback_data=f"optpin_{user_id}_yes")],
+            [InlineKeyboardButton("➡️ Нет, продолжить", callback_data=f"optpin_{user_id}_no")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = "📌 Закрепить пост в канале?"
+        
+        if hasattr(message_or_query, 'edit_message_text'):
+            await message_or_query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            await message_or_query.reply_text(text, reply_markup=reply_markup)
+    else:
+        context.user_data['use_pin'] = False
+        await ask_delayed_option(message_or_query, context, user_id)
+
+async def ask_delayed_option(message_or_query, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Спрашивает, нужна ли отложенная публикация"""
+    has_delayed = has_active_item(user_id, 'delayed')
+    
+    if has_delayed:
+        keyboard = [
+            [InlineKeyboardButton("⏰ Да, с задержкой", callback_data=f"optdelay_{user_id}_yes")],
+            [InlineKeyboardButton("➡️ Нет, продолжить", callback_data=f"optdelay_{user_id}_no")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = "⏰ Опубликовать с задержкой?"
+        
+        if hasattr(message_or_query, 'edit_message_text'):
+            await message_or_query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            await message_or_query.reply_text(text, reply_markup=reply_markup)
+    else:
+        context.user_data['delay_hours'] = 0
+        await ask_skip_option(message_or_query, context, user_id)
+
+async def ask_skip_option(message_or_query, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Спрашивает, нужно ли пропустить модерацию"""
+    sub = has_active_subscription(user_id)
+    has_skip = has_active_item(user_id, 'skip') or sub == 'vip'
+    
+    if has_skip:
+        keyboard = [
+            [InlineKeyboardButton("🎫 Да, пропустить", callback_data=f"optskip_{user_id}_yes")],
+            [InlineKeyboardButton("📋 Нет, на модерацию", callback_data=f"optskip_{user_id}_no")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = "🎫 Пропустить модерацию?"
+        
+        if hasattr(message_or_query, 'edit_message_text'):
+            await message_or_query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            await message_or_query.reply_text(text, reply_markup=reply_markup)
+    else:
+        context.user_data['skip_moderation'] = False
+        await finalize_post_submission(message_or_query, context, user_id)
+
+async def finalize_post_submission(message_or_query, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Финальная отправка поста с учетом всех выбранных опций"""
+    from datetime import datetime, timedelta
+    
+    username = context.bot_data.get(f'username_{user_id}', 'user')
+    if hasattr(message_or_query, 'from_user'):
+        username = message_or_query.from_user.username or message_or_query.from_user.first_name
+    
+    photo_file_id = context.user_data.get('photo_file_id')
+    caption = context.user_data.get('photo_caption', '')
+    selected_channels = context.user_data.get('selected_channels', [])
+    use_pin = context.user_data.get('use_pin', False)
+    delay_hours = context.user_data.get('delay_hours', 0)
+    skip_moderation = context.user_data.get('skip_moderation', False)
+    has_priority = context.user_data.get('has_priority', False)
+    
+    sub = has_active_subscription(user_id)
+    
+    if skip_moderation:
+        # Публикуем сразу (или с задержкой)
+        if delay_hours > 0:
+            # Запланированная публикация
+            scheduled_time = datetime.now() + timedelta(hours=delay_hours)
+            for channel_id in selected_channels:
+                add_scheduled_post(channel_id, user_id, username, photo_file_id, caption, scheduled_time)
+            
+            use_shop_item(user_id, 'delayed')
+            if has_active_item(user_id, 'skip'):
+                use_shop_item(user_id, 'skip')
+            
+            text = f"⏰ Пост запланирован на {scheduled_time.strftime('%H:%M %d.%m')}\n📢 Каналов: {len(selected_channels)}"
+        else:
+            # Мгновенная публикация
+            for channel_id in selected_channels:
+                try:
+                    msg = await context.bot.send_photo(
+                        chat_id=channel_id,
+                        photo=photo_file_id,
+                        caption=caption if caption else None
+                    )
+                    add_published_post(channel_id, user_id, username, msg.message_id)
+                    
+                    if use_pin:
+                        try:
+                            await context.bot.pin_chat_message(channel_id, msg.message_id)
+                        except:
+                            pass
+                    
+                    update_channel_setting(channel_id, 'last_post_time', datetime.now())
+                except Exception as e:
+                    logger.error(f"Error publishing to {channel_id}: {e}")
+            
+            # Списываем предметы
+            if use_pin and has_active_item(user_id, 'pin'):
+                use_shop_item(user_id, 'pin')
+            if has_active_item(user_id, 'skip'):
+                use_shop_item(user_id, 'skip')
+            
+            # Начисляем монеты
+            coin_bonus = 10
+            if sub == 'vip':
+                coin_bonus = int(10 * 3)
+            elif sub == 'pro':
+                coin_bonus = int(10 * 1.5)
+            elif sub == 'basic':
+                coin_bonus = int(10 * 1.2)
+            
+            add_coins(user_id, username, coin_bonus, "Мем опубликован")
+            update_streak(user_id, username)
+            check_daily_quests(user_id, username)
+            
+            text = f"🎉 Мем опубликован!\n💰 +{coin_bonus} монет\n📢 Каналов: {len(selected_channels)}"
+    else:
+        # Отправляем на модерацию
+        for channel_id in selected_channels:
+            add_pending_post(channel_id, user_id, username, photo_file_id, caption, has_priority)
+        
+        if has_priority:
+            use_shop_item(user_id, 'priority')
+        
+        text = f"✅ Отправлено на модерацию\n📢 Каналов: {len(selected_channels)}"
+    
+    # Очищаем состояние
+    context.user_data.clear()
+    
+    if hasattr(message_or_query, 'edit_message_text'):
+        await message_or_query.edit_message_text(text)
+    else:
+        await message_or_query.reply_text(text)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1309,94 +1455,45 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("🏆 Выберите канал для просмотра таблицы лидеров:", reply_markup=reply_markup)
             return
     
-    if action == "all":
-        user_id = int(data_parts[1])
-        
-        if query.from_user.id != user_id:
-            await query.edit_message_text("❌ Это не ваш контент!")
-            return
-        
-        photo_file_id = context.user_data.get('photo_file_id')
-        caption = context.user_data.get('photo_caption', '')
-        username = query.from_user.username or query.from_user.first_name
-        
-        channels = get_channels_with_names()
-        added_count = 0
-        skipped_count = 0
-        
-        for channel in channels:
-            channel_id = channel[0]
-            settings = get_channel_settings(channel_id)
+    if action == "selectch":
+        # Выбор канала (конкретный или все)
+        if data_parts[1] == "all":
+            user_id = int(data_parts[2])
+            if query.from_user.id != user_id:
+                await query.answer("❌ Это не ваш контент!")
+                return
             
-            if not settings.get('allow_global', True):
-                skipped_count += 1
-                continue
+            channels = get_channels_with_names()
+            channel_ids = []
+            for channel in channels:
+                channel_id = channel[0]
+                settings = get_channel_settings(channel_id)
+                if settings.get('allow_global', True) and not is_user_banned(user_id, channel_id):
+                    channel_ids.append(channel_id)
+            
+            context.user_data['selected_channels'] = channel_ids
+            await ask_pin_option(query, context, user_id)
+        else:
+            short_channel_id = data_parts[1]
+            user_id = int(data_parts[2])
+            
+            if query.from_user.id != user_id:
+                await query.answer("❌ Это не ваш контент!")
+                return
+            
+            channel_mapping = context.user_data.get('channel_mapping', {})
+            channel_id = channel_mapping.get(short_channel_id)
+            
+            if not channel_id:
+                await query.edit_message_text("❌ Ошибка: канал не найден.")
+                return
             
             if is_user_banned(user_id, channel_id):
-                skipped_count += 1
-                continue
+                await query.edit_message_text("❌ Вы заблокированы в этом канале.")
+                return
             
-            has_priority = context.user_data.get('has_priority', False)
-            add_pending_post(channel_id, user_id, username, photo_file_id, caption, has_priority)
-            added_count += 1
-        
-        if context.user_data.get('has_priority', False):
-            use_shop_item(user_id, 'priority')
-            context.user_data['has_priority'] = False
-        
-        context.user_data['waiting_for_channel'] = False
-        
-        await query.edit_message_text(
-            f"✅ Ваш контент добавлен в очередь модерации!\n\n"
-            f"📢 Отправлено в {added_count} канал(ов)\n"
-            f"⏭️ Пропущено: {skipped_count}"
-        )
-    
-    elif action == "sel":
-        # Пользователь выбрал канал из списка похожих
-        user_id = int(data_parts[1])
-        short_channel_id = data_parts[2]
-        
-        if query.from_user.id != user_id:
-            await query.edit_message_text("❌ Это не ваш контент!")
-            return
-        
-        # Получаем полный ID канала
-        channel_mapping = context.user_data.get('channel_mapping', {})
-        channel_id = channel_mapping.get(short_channel_id)
-        
-        if not channel_id:
-            await query.edit_message_text("❌ Ошибка: канал не найден.")
-            return
-        
-        try:
-            chat = await context.bot.get_chat(channel_id)
-            channel_name = chat.title
-        except:
-            channel_name = channel_id
-        
-        if is_user_banned(user_id, channel_id):
-            await query.edit_message_text(f"❌ Вы заблокированы в канале '{channel_name}'.")
-            context.user_data['waiting_for_channel'] = False
-            return
-        
-        # Добавляем пост в очередь
-        photo_file_id = context.user_data.get('photo_file_id')
-        caption = context.user_data.get('photo_caption', '')
-        username = query.from_user.username or query.from_user.first_name
-        
-        has_priority = context.user_data.get('has_priority', False)
-        if has_priority:
-            use_shop_item(user_id, 'priority')
-        add_pending_post(channel_id, user_id, username, photo_file_id, caption, has_priority)
-        
-        # Очищаем состояние
-        context.user_data['waiting_for_channel'] = False
-        context.user_data['has_priority'] = False
-        
-        await query.edit_message_text(
-            f"✅ Ваш контент добавлен в очередь модерации канала '{channel_name}'!"
-        )
+            context.user_data['selected_channels'] = [channel_id]
+            await ask_pin_option(query, context, user_id)
     
     elif action == "mod":
         # Админ выбрал канал для модерации
@@ -1867,6 +1964,164 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"✅ Вы купили {item_type} за {cost} монет!")
         else:
             await query.answer("❌ Недостаточно монет!")
+    
+    elif action == "optpin":
+        # Выбор: закреплять или нет
+        user_id = int(data_parts[1])
+        use_pin = data_parts[2] == "yes"
+        
+        if query.from_user.id != user_id:
+            await query.answer("❌ Это не ваш контент!")
+            return
+        
+        context.user_data['use_pin'] = use_pin
+        await ask_delayed_option(query, context, user_id)
+    
+    elif action == "optdelay":
+        # Выбор: с задержкой или нет
+        user_id = int(data_parts[1])
+        
+        if query.from_user.id != user_id:
+            await query.answer("❌ Это не ваш контент!")
+            return
+        
+        if data_parts[2] == "no":
+            context.user_data['delay_hours'] = 0
+            await ask_skip_option(query, context, user_id)
+        else:
+            # Показываем варианты задержки
+            keyboard = [
+                [InlineKeyboardButton("⏱ 1 час", callback_data=f"setdelay_{user_id}_1")],
+                [InlineKeyboardButton("⏱ 3 часа", callback_data=f"setdelay_{user_id}_3")],
+                [InlineKeyboardButton("⏱ 6 часов", callback_data=f"setdelay_{user_id}_6")],
+                [InlineKeyboardButton("⏱ 12 часов", callback_data=f"setdelay_{user_id}_12")],
+                [InlineKeyboardButton("⏱ 24 часа", callback_data=f"setdelay_{user_id}_24")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("⏰ Выберите задержку:", reply_markup=reply_markup)
+    
+    elif action == "setdelay":
+        # Установка конкретной задержки
+        user_id = int(data_parts[1])
+        hours = int(data_parts[2])
+        
+        if query.from_user.id != user_id:
+            await query.answer("❌ Это не ваш контент!")
+            return
+        
+        context.user_data['delay_hours'] = hours
+        await ask_skip_option(query, context, user_id)
+    
+    elif action == "optskip":
+        # Выбор: пропустить модерацию или нет
+        user_id = int(data_parts[1])
+        skip_mod = data_parts[2] == "yes"
+        
+        if query.from_user.id != user_id:
+            await query.answer("❌ Это не ваш контент!")
+            return
+        
+        context.user_data['skip_moderation'] = skip_mod
+        await finalize_post_submission(query, context, user_id)
+    
+    elif action == "skipmod":
+        user_id = int(data_parts[1])
+        if query.from_user.id != user_id:
+            await query.answer("❌ Это не ваш контент!")
+            return
+        
+        photo_file_id = context.user_data.get('photo_file_id')
+        caption = context.user_data.get('photo_caption', '')
+        username = query.from_user.username or query.from_user.first_name
+        channels = get_channels_with_names()
+        
+        if channels:
+            from datetime import datetime
+            for channel in channels:
+                channel_id = channel[0]
+                try:
+                    msg = await context.bot.send_photo(
+                        chat_id=channel_id,
+                        photo=photo_file_id,
+                        caption=caption if caption else None
+                    )
+                    add_published_post(channel_id, user_id, username, msg.message_id)
+                    sub = has_active_subscription(user_id)
+                    if has_active_item(user_id, 'pin') or sub == 'vip':
+                        try:
+                            await context.bot.pin_chat_message(channel_id, msg.message_id)
+                            if has_active_item(user_id, 'pin'):
+                                use_shop_item(user_id, 'pin')
+                        except:
+                            pass
+                    update_channel_setting(channel_id, 'last_post_time', datetime.now())
+                except:
+                    pass
+            
+            if has_active_item(user_id, 'skip'):
+                use_shop_item(user_id, 'skip')
+            
+            sub = has_active_subscription(user_id)
+            coin_bonus = 10
+            if sub == 'vip':
+                coin_bonus = int(10 * 3)
+            elif sub == 'pro':
+                coin_bonus = int(10 * 1.5)
+            elif sub == 'basic':
+                coin_bonus = int(10 * 1.2)
+            
+            add_coins(user_id, username, coin_bonus, "Мем опубликован")
+            context.user_data['waiting_for_channel'] = False
+            await query.edit_message_text("🎫 Пропуск использован! Мем опубликован во всех каналах.")
+        return
+    
+    elif action == "refund":
+        refund_type = data_parts[1]
+        user_id = query.from_user.id
+        username = query.from_user.username or query.from_user.first_name
+        
+        if refund_type == "sub":
+            from datetime import datetime, timedelta
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT subscription_type, created_at FROM user_subscriptions WHERE user_id = %s AND expires_at > NOW()", (user_id,))
+            sub_info = cur.fetchone()
+            
+            if not sub_info:
+                await query.answer("❌ Нет активной подписки!")
+                cur.close()
+                conn.close()
+                return
+            
+            sub_type, created_at = sub_info
+            
+            # Проверяем, прошел ли 1 день
+            if (datetime.now() - created_at) >= timedelta(days=1):
+                await query.answer("❌ Возврат возможен только в первый день!")
+                cur.close()
+                conn.close()
+                return
+            
+            # Рассчитываем возврат (50%)
+            costs = {'basic': 2000, 'pro': 5000, 'vip': 50000}
+            refund_amount = costs[sub_type] // 2
+            
+            # Удаляем подписку
+            cur.execute("DELETE FROM user_subscriptions WHERE user_id = %s", (user_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            # Возвращаем монеты
+            add_coins(user_id, username, refund_amount, f"🔙 Возврат {sub_type.upper()} (-50%)")
+            
+            await query.answer("✅ Возврат оформлен!")
+            await query.edit_message_text(
+                f"🔙 Подписка {sub_type.upper()} отменена\n\n"
+                f"💰 Возвращено: {refund_amount} монет (50%)\n\n"
+                f"ℹ️ Комиссия за возврат: 50%"
+            )
+        return
     
     elif action == "prot":
         if not context.user_data.get('buying_protection'):
@@ -2544,12 +2799,28 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = conn.cursor()
         cur.execute("SELECT amount, reason, created_at FROM coin_transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT 10", (user_id,))
         transactions = cur.fetchall()
+        
+        # Проверяем подписку
+        cur.execute("SELECT subscription_type, expires_at, created_at FROM user_subscriptions WHERE user_id = %s AND expires_at > NOW()", (user_id,))
+        sub_info = cur.fetchone()
         cur.close()
         conn.close()
         
         response = f"💰 Баланс @{username}\n\n"
         response += f"💵 Текущий баланс: {balance} монет\n"
         response += f"📈 Всего заработано: {total_earned} монет\n\n"
+        
+        keyboard = []
+        if sub_info:
+            sub_type, expires_at, created_at = sub_info
+            from datetime import datetime, timedelta
+            days_left = (expires_at - datetime.now()).days
+            response += f"💎 Подписка: {sub_type.upper()}\n"
+            response += f"⏰ Осталось: {days_left} дней\n\n"
+            
+            # Можно вернуть только в первый день
+            if (datetime.now() - created_at) < timedelta(days=1):
+                keyboard.append([InlineKeyboardButton("🔙 Вернуть подписку (-50%)", callback_data="refund_sub")])
         
         if transactions:
             response += "📜 Последние транзакции:\n"
@@ -2559,7 +2830,11 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             response += "📜 Транзакций пока нет"
         
-        await update.message.reply_text(response)
+        if keyboard:
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(response, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(response)
     except Exception as e:
         logger.error(f"Error in balance: {e}")
         await update.message.reply_text("❌ Ошибка получения баланса.")
