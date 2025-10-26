@@ -372,6 +372,40 @@ def spend_coins(user_id: int, amount: int, reason: str) -> bool:
         cur.close()
         conn.close()
 
+def transfer_coins(from_user_id: int, to_user_id: int, amount: int, from_username: str, to_username: str) -> bool:
+    if from_user_id == SUPPORT_ADMIN_ID:
+        add_coins(to_user_id, to_username, amount, f"💸 Перевод от @{from_username}")
+        return True
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE user_coins SET balance = balance - %s "
+            "WHERE user_id = %s AND balance >= %s RETURNING balance",
+            (amount, from_user_id, amount)
+        )
+        result = cur.fetchone()
+        if not result:
+            conn.rollback()
+            return False
+        cur.execute(
+            "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+            (from_user_id, -amount, f"💸 Перевод @{to_username}")
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        add_coins(to_user_id, to_username, amount, f"💸 Перевод от @{from_username}")
+        return True
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error transferring coins: {e}")
+        return False
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
+
 def update_streak(user_id: int, username: str):
     from datetime import date, timedelta
     conn = get_db_connection()
@@ -2186,6 +2220,7 @@ async def updatemenu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             BotCommand("shop", "Магазин привилегий"),
             BotCommand("lootbox", "Открыть лутбокс"),
             BotCommand("referral", "Реферальная программа"),
+            BotCommand("pay", "Перевести мемкоины"),
             BotCommand("weekwinner", "Мем недели"),
             BotCommand("leaderboard", "Таблица лидеров"),
             BotCommand("admin", "Панель администратора"),
@@ -2364,6 +2399,79 @@ async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = f"https://t.me/{bot_username}?start=ref_{code}"
     await update.message.reply_text(f"🎁 Реферальная программа\n\n👥 Приглашено: {total}\n💰 Награды: {rewarded}\n\n🔗 Ваша ссылка:\n{link}\n\n💵 +100 монет за друга\n💵 +50 когда друг опубликует 5 мемов")
 
+async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "💸 Перевод мемкоинов\n\n"
+            "Использование: /pay <@username или ID> <сумма>\n\n"
+            "Примеры:\n"
+            "/pay @user 100\n"
+            "/pay 123456789 50"
+        )
+        return
+    
+    try:
+        recipient = context.args[0]
+        amount = int(context.args[1])
+        
+        if amount <= 0:
+            await update.message.reply_text("❌ Сумма должна быть положительной!")
+            return
+        
+        recipient_id = None
+        recipient_username = None
+        
+        if recipient.startswith('@'):
+            recipient_username = recipient[1:]
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM user_coins WHERE username = %s", (recipient_username,))
+            result = cur.fetchone()
+            cur.close()
+            conn.close()
+            if result:
+                recipient_id = result[0]
+            else:
+                await update.message.reply_text(f"❌ Пользователь {recipient} не найден в системе.")
+                return
+        else:
+            recipient_id = int(recipient)
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT username FROM user_coins WHERE user_id = %s", (recipient_id,))
+            result = cur.fetchone()
+            cur.close()
+            conn.close()
+            if result:
+                recipient_username = result[0]
+            else:
+                recipient_username = f"user_{recipient_id}"
+        
+        if recipient_id == user_id:
+            await update.message.reply_text("❌ Нельзя переводить монеты самому себе!")
+            return
+        
+        if transfer_coins(user_id, recipient_id, amount, username, recipient_username):
+            await update.message.reply_text(f"✅ Переведено {amount} монет пользователю @{recipient_username}")
+            try:
+                await context.bot.send_message(
+                    chat_id=recipient_id,
+                    text=f"💰 Вы получили {amount} мемкоинов от @{username}!"
+                )
+            except:
+                pass
+        else:
+            await update.message.reply_text("❌ Недостаточно монет для перевода!")
+    
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Сумма должна быть числом.")
+    except Exception as e:
+        logger.error(f"Error in pay command: {e}")
+        await update.message.reply_text("❌ Ошибка при переводе монет.")
+
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
@@ -2530,6 +2638,7 @@ async def post_init(application: Application):
         BotCommand("shop", "Магазин привилегий"),
         BotCommand("lootbox", "Открыть лутбокс"),
         BotCommand("referral", "Реферальная программа"),
+        BotCommand("pay", "Перевести мемкоины"),
         BotCommand("weekwinner", "Мем недели"),
         BotCommand("leaderboard", "Таблица лидеров"),
         BotCommand("admin", "Панель администратора"),
@@ -2634,6 +2743,7 @@ async def start_bot():
     application.add_handler(CommandHandler("shop", shop))
     application.add_handler(CommandHandler("lootbox", lootbox))
     application.add_handler(CommandHandler("referral", referral))
+    application.add_handler(CommandHandler("pay", pay))
     application.add_handler(CommandHandler("admin", admin))
     application.add_handler(CommandHandler("weekwinner", weekwinner))
     application.add_handler(CommandHandler("moderate", moderate))
