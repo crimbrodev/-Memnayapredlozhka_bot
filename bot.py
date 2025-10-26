@@ -2450,7 +2450,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 recipient_username = f"user_{recipient_id}"
         
-        if recipient_id == user_id:
+        if recipient_id == user_id and user_id != SUPPORT_ADMIN_ID:
             await update.message.reply_text("❌ Нельзя переводить монеты самому себе!")
             return
         
