@@ -745,47 +745,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         return
     
-    # Проверяем только купленный пропуск (VIP не автопубликует)
-    if has_active_item(user_id, 'skip'):
-        channels = get_channels_with_names()
-        if channels:
-            photo = update.message.photo[-1]
-            caption = sanitize_caption(update.message.caption or "")
-            from datetime import datetime
-            for channel in channels:
-                channel_id = channel[0]
-                try:
-                    msg = await context.bot.send_photo(
-                        chat_id=channel_id,
-                        photo=photo.file_id,
-                        caption=caption if caption else None
-                    )
-                    add_published_post(channel_id, user_id, username, msg.message_id)
-                    if has_active_item(user_id, 'pin'):
-                        try:
-                            await context.bot.pin_chat_message(channel_id, msg.message_id)
-                            use_shop_item(user_id, 'pin')
-                        except:
-                            pass
-                    update_channel_setting(channel_id, 'last_post_time', datetime.now())
-                except:
-                    pass
-            use_shop_item(user_id, 'skip')
-            
-            # Применяем бонусы подписки
-            sub = has_active_subscription(user_id)
-            coin_bonus = 10
-            if sub == 'vip':
-                coin_bonus = int(10 * 3)
-            elif sub == 'pro':
-                coin_bonus = int(10 * 1.5)
-            elif sub == 'basic':
-                coin_bonus = int(10 * 1.2)
-            
-            add_coins(user_id, username, coin_bonus, "Мем опубликован")
-            await update.message.reply_text("🎫 Пропуск использован! Мем опубликован во всех каналах без модерации.")
-            return
-    
     channels = get_channels_with_names()
     
     if not channels:
@@ -845,6 +804,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Сохраняем username для дальнейшего использования
+    context.bot_data[f'username_{user_id}'] = username
     
     await update.message.reply_text(
         "📤 Напишите название или @username канала, в который хотите отправить контент:\n\n"
