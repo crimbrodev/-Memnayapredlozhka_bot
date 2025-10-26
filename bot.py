@@ -98,13 +98,19 @@ def update_channel_admins(channel_id: str, admins: list):
     cur.close()
     conn.close()
 
-def add_pending_post(channel_id: str, user_id: int, username: str, photo_file_id: str, caption: str = ""):
+def add_pending_post(channel_id: str, user_id: int, username: str, photo_file_id: str, caption: str = "", priority: bool = False):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO pending_posts (channel_id, user_id, username, photo_file_id, caption) VALUES (%s, %s, %s, %s, %s)",
-        (channel_id, user_id, username, photo_file_id, caption)
-    )
+    if priority:
+        cur.execute(
+            "INSERT INTO pending_posts (channel_id, user_id, username, photo_file_id, caption, created_at) VALUES (%s, %s, %s, %s, %s, '1970-01-01')",
+            (channel_id, user_id, username, photo_file_id, caption)
+        )
+    else:
+        cur.execute(
+            "INSERT INTO pending_posts (channel_id, user_id, username, photo_file_id, caption) VALUES (%s, %s, %s, %s, %s)",
+            (channel_id, user_id, username, photo_file_id, caption)
+        )
     conn.commit()
     cur.close()
     conn.close()
@@ -519,10 +525,53 @@ def has_active_item(user_id: int, item_type: str):
     conn.close()
     return result is not None
 
-def use_shop_item(user_id: int, item_type: str):
+def use_shop_item(user_id: int, item_type: str, channel_id: str = None):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE shop_purchases SET used = TRUE WHERE user_id = %s AND item_type = %s AND used = FALSE LIMIT 1", (user_id, item_type))
+    if channel_id:
+        cur.execute("UPDATE shop_purchases SET used = TRUE WHERE user_id = %s AND item_type = %s AND channel_id = %s AND used = FALSE LIMIT 1", (user_id, item_type, channel_id))
+    else:
+        cur.execute("UPDATE shop_purchases SET used = TRUE WHERE user_id = %s AND item_type = %s AND used = FALSE LIMIT 1", (user_id, item_type))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def has_active_subscription(user_id: int):
+    from datetime import datetime
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT subscription_type FROM user_subscriptions WHERE user_id = %s AND expires_at > %s", (user_id, datetime.now()))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result[0] if result else None
+
+def buy_subscription(user_id: int, username: str, sub_type: str, cost: int, days: int):
+    from datetime import datetime, timedelta
+    if not spend_coins(user_id, cost, f"💎 Подписка {sub_type}"):
+        return False
+    conn = get_db_connection()
+    cur = conn.cursor()
+    expires = datetime.now() + timedelta(days=days)
+    cur.execute("INSERT INTO user_subscriptions (user_id, subscription_type, expires_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s, expires_at = %s", (user_id, sub_type, expires, sub_type, expires))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return True
+
+def has_channel_protection(user_id: int, channel_id: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM channel_protections WHERE user_id = %s AND channel_id = %s AND used = FALSE", (user_id, channel_id))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result is not None
+
+def use_channel_protection(user_id: int, channel_id: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE channel_protections SET used = TRUE WHERE user_id = %s AND channel_id = %s AND used = FALSE LIMIT 1", (user_id, channel_id))
     conn.commit()
     cur.close()
     conn.close()
@@ -657,12 +706,24 @@ async def show_next_post(query, context: ContextTypes.DEFAULT_TYPE, channel_id: 
         caption_text += f"\n\n💬 Подпись: {caption}"
     
     try:
+        from telegram import InputMediaPhoto
         await query.edit_message_media(
-            media={"type": "photo", "media": photo_file_id, "caption": caption_text},
+            media=InputMediaPhoto(media=photo_file_id, caption=caption_text),
             reply_markup=reply_markup
         )
-    except:
-        await query.edit_message_text(caption_text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error editing media: {e}")
+        try:
+            await query.message.delete()
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=photo_file_id,
+                caption=caption_text,
+                reply_markup=reply_markup
+            )
+        except Exception as e2:
+            logger.error(f"Error sending new photo: {e2}")
+            await query.edit_message_text(caption_text, reply_markup=reply_markup)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message:
@@ -673,6 +734,48 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not update.message.photo:
         return
+    
+    # Проверяем привилегию "пропуск модерации" или VIP
+    sub = has_active_subscription(user_id)
+    if has_active_item(user_id, 'skip') or sub == 'vip':
+        channels = get_channels_with_names()
+        if channels:
+            photo = update.message.photo[-1]
+            caption = sanitize_caption(update.message.caption or "")
+            from datetime import datetime
+            for channel in channels:
+                channel_id = channel[0]
+                try:
+                    msg = await context.bot.send_photo(
+                        chat_id=channel_id,
+                        photo=photo.file_id,
+                        caption=caption if caption else None
+                    )
+                    add_published_post(channel_id, user_id, username, msg.message_id)
+                    if has_active_item(user_id, 'pin'):
+                        try:
+                            await context.bot.pin_chat_message(channel_id, msg.message_id)
+                            use_shop_item(user_id, 'pin')
+                        except:
+                            pass
+                    update_channel_setting(channel_id, 'last_post_time', datetime.now())
+                except:
+                    pass
+            if has_active_item(user_id, 'skip'):
+                use_shop_item(user_id, 'skip')
+            
+            # Применяем бонусы подписки
+            coin_bonus = 10
+            if sub == 'vip':
+                coin_bonus = int(10 * 3)
+            elif sub == 'pro':
+                coin_bonus = int(10 * 1.5)
+            elif sub == 'basic':
+                coin_bonus = int(10 * 1.2)
+            
+            add_coins(user_id, username, coin_bonus, "Мем опубликован")
+            await update.message.reply_text("🎫 Пропуск использован! Мем опубликован во всех каналах без модерации.")
+            return
     
     channels = get_channels_with_names()
     
@@ -723,6 +826,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['photo_caption'] = caption
     context.user_data['waiting_for_channel'] = True
     
+    # Проверяем привилегию приоритета или подписку
+    sub = has_active_subscription(user_id)
+    if has_active_item(user_id, 'priority') or sub in ['basic', 'pro', 'vip']:
+        context.user_data['has_priority'] = True
+    
     keyboard = [
         [InlineKeyboardButton("🌐 Отправить во все каналы", callback_data=f"all_{user_id}")]
     ]
@@ -735,6 +843,140 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /pay - шаг 1: получатель
+    if context.user_data and context.user_data.get('awaiting_pay_recipient'):
+        context.user_data['pay_recipient'] = update.message.text.strip()
+        context.user_data['awaiting_pay_recipient'] = False
+        context.user_data['awaiting_pay_amount'] = True
+        await update.message.reply_text("💰 Введите сумму:")
+        return
+    
+    # /pay - шаг 2: сумма
+    if context.user_data and context.user_data.get('awaiting_pay_amount'):
+        try:
+            amount = int(update.message.text.strip())
+            recipient = context.user_data.get('pay_recipient')
+            context.user_data['awaiting_pay_amount'] = False
+            
+            user_id = update.effective_user.id
+            username = update.effective_user.username or update.effective_user.first_name
+            
+            if amount <= 0:
+                await update.message.reply_text("❌ Сумма должна быть положительной!")
+                return
+            
+            recipient_id = None
+            recipient_username = None
+            
+            if recipient.startswith('@'):
+                recipient_username = recipient[1:]
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT user_id FROM user_coins WHERE username = %s", (recipient_username,))
+                result = cur.fetchone()
+                cur.close()
+                conn.close()
+                if result:
+                    recipient_id = result[0]
+                else:
+                    await update.message.reply_text(f"❌ Пользователь {recipient} не найден в системе.")
+                    return
+            else:
+                recipient_id = int(recipient)
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT username FROM user_coins WHERE user_id = %s", (recipient_id,))
+                result = cur.fetchone()
+                cur.close()
+                conn.close()
+                if result:
+                    recipient_username = result[0]
+                else:
+                    recipient_username = f"user_{recipient_id}"
+            
+            if recipient_id == user_id and user_id != SUPPORT_ADMIN_ID:
+                await update.message.reply_text("❌ Нельзя переводить монеты самому себе!")
+                return
+            
+            if transfer_coins(user_id, recipient_id, amount, username, recipient_username):
+                await update.message.reply_text(f"✅ Переведено {amount} монет пользователю @{recipient_username}")
+                try:
+                    await context.bot.send_message(recipient_id, f"💰 Вы получили {amount} мемкоинов от @{username}!")
+                except:
+                    pass
+            else:
+                await update.message.reply_text("❌ Недостаточно монет для перевода!")
+            return
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат. Сумма должна быть числом.")
+            return
+    
+    # /addchannel
+    if context.user_data and context.user_data.get('awaiting_addchannel'):
+        channel_id = update.message.text.strip()
+        context.user_data['awaiting_addchannel'] = False
+        await process_addchannel(update, context, channel_id)
+        return
+    
+    # /support
+    if context.user_data and context.user_data.get('awaiting_support'):
+        message = update.message.text.strip()
+        context.user_data['awaiting_support'] = False
+        await process_support(update, context, message)
+        return
+    
+    # /reply - шаг 1: user_id
+    if context.user_data and context.user_data.get('awaiting_reply_user'):
+        try:
+            user_id = int(update.message.text.strip())
+            context.user_data['reply_user_id'] = user_id
+            context.user_data['awaiting_reply_user'] = False
+            context.user_data['awaiting_reply_message'] = True
+            await update.message.reply_text("💬 Введите сообщение:")
+            return
+        except ValueError:
+            await update.message.reply_text("❌ Неверный ID. Введите число:")
+            return
+    
+    # /reply - шаг 2: сообщение
+    if context.user_data and context.user_data.get('awaiting_reply_message'):
+        user_id = context.user_data.get('reply_user_id')
+        reply_message = update.message.text.strip()
+        context.user_data['awaiting_reply_message'] = False
+        
+        try:
+            await context.bot.send_message(user_id, f"💬 Ответ от техподдержки:\n\n{reply_message}")
+            await update.message.reply_text(f"✅ Ответ отправлен пользователю {user_id}")
+        except Exception as e:
+            logger.error(f"Error sending reply: {e}")
+            await update.message.reply_text("❌ Ошибка отправки ответа")
+        return
+    
+    # /update - шаг 1: message_id
+    if context.user_data and context.user_data.get('awaiting_update_msgid'):
+        try:
+            message_id = int(update.message.text.strip())
+            context.user_data['update_message_id'] = message_id
+            context.user_data['awaiting_update_msgid'] = False
+            context.user_data['awaiting_update_reactions'] = True
+            await update.message.reply_text("👍 Введите количество реакций:")
+            return
+        except ValueError:
+            await update.message.reply_text("❌ Неверный ID. Введите число:")
+            return
+    
+    # /update - шаг 2: reactions
+    if context.user_data and context.user_data.get('awaiting_update_reactions'):
+        try:
+            reactions = int(update.message.text.strip())
+            message_id = context.user_data.get('update_message_id')
+            context.user_data['awaiting_update_reactions'] = False
+            await process_update(update, context, message_id, reactions)
+            return
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат. Введите число:")
+            return
+    
     # Обрабатываем ручной ввод настроек
     if context.user_data and context.user_data.get('awaiting_input'):
         setting_type = context.user_data.get('awaiting_input')
@@ -815,9 +1057,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['waiting_for_channel'] = False
             return
         
-        add_pending_post(channel_id, user_id, username, photo_file_id, caption)
+        has_priority = context.user_data.get('has_priority', False)
+        if has_priority:
+            use_shop_item(user_id, 'priority')
+        add_pending_post(channel_id, user_id, username, photo_file_id, caption, has_priority)
         
         context.user_data['waiting_for_channel'] = False
+        context.user_data['has_priority'] = False
         
         await update.message.reply_text(
             f"✅ Ваш контент добавлен в очередь модерации канала '{channel_name}'!"
@@ -1090,8 +1336,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 skipped_count += 1
                 continue
             
-            add_pending_post(channel_id, user_id, username, photo_file_id, caption)
+            has_priority = context.user_data.get('has_priority', False)
+            add_pending_post(channel_id, user_id, username, photo_file_id, caption, has_priority)
             added_count += 1
+        
+        if context.user_data.get('has_priority', False):
+            use_shop_item(user_id, 'priority')
+            context.user_data['has_priority'] = False
         
         context.user_data['waiting_for_channel'] = False
         
@@ -1134,10 +1385,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = context.user_data.get('photo_caption', '')
         username = query.from_user.username or query.from_user.first_name
         
-        add_pending_post(channel_id, user_id, username, photo_file_id, caption)
+        has_priority = context.user_data.get('has_priority', False)
+        if has_priority:
+            use_shop_item(user_id, 'priority')
+        add_pending_post(channel_id, user_id, username, photo_file_id, caption, has_priority)
         
         # Очищаем состояние
         context.user_data['waiting_for_channel'] = False
+        context.user_data['has_priority'] = False
         
         await query.edit_message_text(
             f"✅ Ваш контент добавлен в очередь модерации канала '{channel_name}'!"
@@ -1451,12 +1706,160 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(response)
     
+    elif action == "shop":
+        shop_action = data_parts[1]
+        user_id = query.from_user.id
+        balance, _ = get_user_balance(user_id)
+        
+        if shop_action == "items":
+            keyboard = [
+                [InlineKeyboardButton("🎁 Премиум лутбокс (500)", callback_data="buy_lootbox")],
+                [InlineKeyboardButton("🎰 Рулетка удачи (500)", callback_data="buy_roulette")],
+                [InlineKeyboardButton("🎫 Пропуск модерации (2000)", callback_data="buy_skip")],
+                [InlineKeyboardButton("⚡ Приоритет (1000)", callback_data="buy_priority")],
+                [InlineKeyboardButton("📌 Закрепить пост (3000)", callback_data="buy_pin")],
+                [InlineKeyboardButton("🛡️ Защита от бана (5000)", callback_data="buy_protection")],
+                [InlineKeyboardButton("⏰ Отложенная публикация (500)", callback_data="buy_delayed")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="shop_back")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"📦 Одноразовые товары\n\n"
+                f"💰 Баланс: {balance} монет\n\n"
+                f"🎁 Премиум лутбокс - 200-2000 монет\n"
+                f"🎰 Рулетка - шанс выиграть до 5000\n"
+                f"🎫 Пропуск - без модерации\n"
+                f"⚡ Приоритет - первым в очереди\n"
+                f"📌 Закрепить - пост будет закреплен\n"
+                f"🛡️ Защита - отменяет бан 1 раз\n"
+                f"⏰ Отложенная - по расписанию",
+                reply_markup=reply_markup
+            )
+            return
+        elif shop_action == "subs":
+            sub = has_active_subscription(user_id)
+            keyboard = [
+                [InlineKeyboardButton("🌟 Basic (2000 / 30 дней)", callback_data="buy_sub_basic")],
+                [InlineKeyboardButton("⭐ Pro (5000 / 14 дней)", callback_data="buy_sub_pro")],
+                [InlineKeyboardButton("👑 VIP (50000 / 7 дней)", callback_data="buy_sub_vip")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="shop_back")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            sub_text = f"\n\n💎 Активна: {sub}" if sub else ""
+            await query.edit_message_text(
+                f"💎 Подписки Premium\n\n"
+                f"💰 Баланс: {balance} монет{sub_text}\n\n"
+                f"🌟 Basic:\n• Автоприоритет\n• +20% монет\n• 1 лутбокс/неделю\n\n"
+                f"⭐ Pro:\n• Все из Basic\n• +50% монет\n• 1 пропуск/неделю\n• 2 лутбокса/неделю\n\n"
+                f"👑 VIP:\n• Все из Pro\n• +200% монет\n• Безлимит пропусков\n• Защита от бана\n• 1 лутбокс/день",
+                reply_markup=reply_markup
+            )
+            return
+        elif shop_action == "back":
+            sub = has_active_subscription(user_id)
+            keyboard = [
+                [InlineKeyboardButton("📦 Одноразовые товары", callback_data="shop_items")],
+                [InlineKeyboardButton("💎 Подписки Premium", callback_data="shop_subs")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            sub_text = f"\n💎 Активна: {sub}" if sub else ""
+            await query.edit_message_text(
+                f"🛒 Магазин\n\n"
+                f"💰 Баланс: {balance} монет{sub_text}\n\n"
+                f"Выберите категорию:",
+                reply_markup=reply_markup
+            )
+            return
+    
     elif action == "buy":
         item_type = data_parts[1]
         user_id = query.from_user.id
         username = query.from_user.username or query.from_user.first_name
         
-        costs = {'priority': 1000, 'skip': 2000, 'pin': 3000}
+        if item_type == "sub":
+            sub_type = data_parts[2]
+            costs = {'basic': 2000, 'pro': 5000, 'vip': 50000}
+            days = {'basic': 30, 'pro': 14, 'vip': 7}
+            cost = costs[sub_type]
+            
+            if buy_subscription(user_id, username, sub_type, cost, days[sub_type]):
+                await query.answer("✅ Подписка активирована!")
+                await query.edit_message_text(f"✅ Подписка {sub_type.upper()} активирована на {days[sub_type]} дней!")
+            else:
+                await query.answer("❌ Недостаточно монет!")
+            return
+        
+        if item_type == "lootbox":
+            import random
+            cost = 500
+            if spend_coins(user_id, cost, "🎁 Премиум лутбокс"):
+                roll = random.random()
+                if roll < 0.01:
+                    reward = 2000
+                elif roll < 0.10:
+                    reward = random.randint(1000, 1500)
+                elif roll < 0.40:
+                    reward = random.randint(500, 1000)
+                else:
+                    reward = random.randint(200, 500)
+                add_coins(user_id, username, reward, "🎁 Лутбокс")
+                await query.answer(f"🎉 +{reward} монет!")
+                await query.edit_message_text(f"🎁 Лутбокс открыт!\n\n💰 Вы получили: {reward} монет")
+            else:
+                await query.answer("❌ Недостаточно монет!")
+            return
+        
+        if item_type == "roulette":
+            import random
+            cost = 500
+            if spend_coins(user_id, cost, "🎰 Рулетка"):
+                roll = random.random()
+                if roll < 0.02:
+                    reward = 5000
+                elif roll < 0.10:
+                    reward = 2000
+                elif roll < 0.30:
+                    reward = 1000
+                elif roll < 0.60:
+                    reward = 500
+                else:
+                    reward = 0
+                if reward > 0:
+                    add_coins(user_id, username, reward, "🎰 Рулетка")
+                    await query.answer(f"🎉 +{reward} монет!")
+                    await query.edit_message_text(f"🎰 Рулетка!\n\n🎉 Выигрыш: {reward} монет")
+                else:
+                    await query.answer("😔 Не повезло")
+                    await query.edit_message_text("🎰 Рулетка!\n\n😔 Не повезло. Попробуйте еще!")
+            else:
+                await query.answer("❌ Недостаточно монет!")
+            return
+        
+        if item_type == 'protection':
+            cost = 5000
+            if spend_coins(user_id, cost, "🛡️ Защита от бана"):
+                user_channels = get_user_channels(user_id)
+                if user_channels:
+                    keyboard = []
+                    for ch_id in user_channels:
+                        try:
+                            chat = await context.bot.get_chat(ch_id)
+                            channel_name = chat.title
+                        except:
+                            channel_name = ch_id
+                        short_channel_id = hashlib.sha256(ch_id.encode()).hexdigest()[:8]
+                        keyboard.append([InlineKeyboardButton(f"📌 {channel_name}", callback_data=f"prot_{short_channel_id}")])
+                    context.user_data['channel_mapping'] = {hashlib.sha256(ch[0].encode()).hexdigest()[:8]: ch[0] for ch in [(ch,) for ch in user_channels]}
+                    context.user_data['buying_protection'] = True
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await query.edit_message_text("🛡️ Выберите канал для защиты:", reply_markup=reply_markup)
+                else:
+                    await query.answer("❌ Вы не админ каналов!")
+            else:
+                await query.answer("❌ Недостаточно монет!")
+            return
+        
+        costs = {'priority': 1000, 'skip': 2000, 'pin': 3000, 'delayed': 500}
         cost = costs.get(item_type, 0)
         
         if buy_shop_item(user_id, username, item_type, cost, 24):
@@ -1464,6 +1867,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"✅ Вы купили {item_type} за {cost} монет!")
         else:
             await query.answer("❌ Недостаточно монет!")
+    
+    elif action == "prot":
+        if not context.user_data.get('buying_protection'):
+            return
+        short_channel_id = data_parts[1]
+        channel_mapping = context.user_data.get('channel_mapping', {})
+        channel_id = channel_mapping.get(short_channel_id)
+        user_id = query.from_user.id
+        
+        if channel_id:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("INSERT INTO channel_protections (user_id, channel_id) VALUES (%s, %s)", (user_id, channel_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            try:
+                chat = await context.bot.get_chat(channel_id)
+                channel_name = chat.title
+            except:
+                channel_name = channel_id
+            
+            context.user_data['buying_protection'] = False
+            await query.answer("✅ Защита активирована!")
+            await query.edit_message_text(f"🛡️ Защита от бана активирована для '{channel_name}'!")
+        return
     
     elif action in ["app", "rej", "ban", "next"]:
         # Админ модерирует пост
@@ -1546,7 +1976,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 
                 add_published_post(channel_id, user_id, username, msg.message_id)
-                add_coins(user_id, username, 10, "Мем опубликован")
+                
+                # Проверяем привилегию закрепления или VIP
+                sub = has_active_subscription(user_id)
+                if has_active_item(user_id, 'pin') or sub == 'vip':
+                    try:
+                        await context.bot.pin_chat_message(channel_id, msg.message_id)
+                        if has_active_item(user_id, 'pin'):
+                            use_shop_item(user_id, 'pin')
+                    except Exception as e:
+                        logger.error(f"Error pinning message: {e}")
+                
+                # Применяем бонусы подписки
+                sub = has_active_subscription(user_id)
+                coin_bonus = 10
+                if sub == 'vip':
+                    coin_bonus = int(10 * 3)  # +200%
+                elif sub == 'pro':
+                    coin_bonus = int(10 * 1.5)  # +50%
+                elif sub == 'basic':
+                    coin_bonus = int(10 * 1.2)  # +20%
+                
+                add_coins(user_id, username, coin_bonus, "Мем опубликован")
                 update_streak(user_id, username)
                 check_daily_quests(user_id, username)
                 
@@ -1580,9 +2031,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
             except Exception as e:
                 logger.error(f"Ошибка публикации в {channel_id}: {str(e)}")
-                await query.edit_message_caption(
-                    caption=query.message.caption + "\n\n❌ ОШИБКА ПУБЛИКАЦИИ"
-                )
+                remove_pending_post(post_id)
+                await show_next_post(query, context, channel_id)
         
         elif action == "rej":
             remove_pending_post(post_id)
@@ -1599,6 +2049,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_next_post(query, context, channel_id)
         
         elif action == "ban":
+            # Проверяем защиту от бана
+            if has_channel_protection(user_id, channel_id):
+                use_channel_protection(user_id, channel_id)
+                await query.answer("🛡️ Защита сработала!")
+                try:
+                    await context.bot.send_message(user_id, "🛡️ Ваша защита от бана сработала!")
+                except:
+                    pass
+                await show_next_post(query, context, channel_id)
+                return
+            
+            # Проверяем VIP подписку
+            sub = has_active_subscription(user_id)
+            if sub == 'vip':
+                await query.answer("👑 VIP защищен от бана!")
+                try:
+                    await context.bot.send_message(user_id, "👑 Ваша VIP подписка защитила вас от бана!")
+                except:
+                    pass
+                await show_next_post(query, context, channel_id)
+                return
+            
             ban_user(user_id, username, query.from_user.id, channel_id)
             remove_pending_post(post_id)
             log_action(channel_id, 'banned', user_id, query.from_user.id, post_id, f"User {username} banned")
@@ -1622,20 +2094,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    if not context.args or len(context.args) == 0:
-        await update.message.reply_text(
-            "❌ Использование: /addchannel <channel_id>\n\n"
-            "Примеры:\n"
-            "/addchannel @mychannel\n"
-            "/addchannel -1001234567890\n\n"
-            "📝 Убедитесь, что:\n"
-            "1. Бот добавлен в канал как администратор\n"
-            "2. У бота есть права на публикацию сообщений\n"
-            "3. Вы сами являетесь администратором канала"
-        )
-        return
-    
-    channel_id = context.args[0]
+    context.user_data['awaiting_addchannel'] = True
+    await update.message.reply_text(
+        "➕ Добавление канала\n\n"
+        "Введите @username или ID канала:\n\n"
+        "📝 Убедитесь, что:\n"
+        "1. Бот добавлен в канал как администратор\n"
+        "2. У бота есть права на публикацию сообщений\n"
+        "3. Вы сами являетесь администратором канала"
+    )
+    return
+
+async def process_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str):
+    user_id = update.effective_user.id
     
     if not validate_channel_id(channel_id):
         await update.message.reply_text("❌ Неверный формат ID канала!\n\nИспользуйте @username или -100XXXXXXXXXX")
@@ -1678,6 +2149,30 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in addchannel: {str(e)}")
         await update.message.reply_text("❌ Ошибка при добавлении канала.")
 
+async def process_support(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name or f"user_{user_id}"
+    
+    support_text = (
+        f"🆘 Новое обращение в поддержку\n\n"
+        f"👤 От: @{username} (ID: {user_id})\n"
+        f"💬 Сообщение: {message}\n\n"
+        f"📝 Ответить: /reply {user_id} ваш ответ"
+    )
+    
+    try:
+        await context.bot.send_message(SUPPORT_ADMIN_ID, support_text)
+        await update.message.reply_text(
+            "✅ Ваше обращение отправлено в техподдержку!\n"
+            "Мы ответим вам в ближайшее время."
+        )
+    except Exception as e:
+        logger.error(f"Error sending support message: {e}")
+        await update.message.reply_text(
+            "❌ Ошибка отправки сообщения в поддержку.\n"
+            "Попробуйте позже или обратитесь напрямую: @crimbr6"
+        )
+
 async def channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_channel_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администраторам каналов.")
@@ -1701,90 +2196,26 @@ async def channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response)
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "🛠️ Техническая поддержка\n\n"
-            "Напишите ваш вопрос после команды:\n"
-            "/support ваш вопрос или проблема\n\n"
-            "Пример:\n"
-            "/support Не могу добавить канал, выдает ошибку"
-        )
-        return
-    
-    user_id = update.effective_user.id
-    username = update.effective_user.username or update.effective_user.first_name or f"user_{user_id}"
-    message = " ".join(context.args)
-    
-    support_text = (
-        f"🆘 Новое обращение в поддержку\n\n"
-        f"👤 От: @{username} (ID: {user_id})\n"
-        f"💬 Сообщение: {message}\n\n"
-        f"📝 Ответить: /reply {user_id} ваш ответ"
-    )
-    
-    try:
-        await context.bot.send_message(
-            chat_id=SUPPORT_ADMIN_ID,
-            text=support_text
-        )
-        await update.message.reply_text(
-            "✅ Ваше обращение отправлено в техподдержку!\n"
-            "Мы ответим вам в ближайшее время."
-        )
-    except Exception as e:
-        logger.error(f"Error sending support message: {e}")
-        await update.message.reply_text(
-            "❌ Ошибка отправки сообщения в поддержку.\n"
-            "Попробуйте позже или обратитесь напрямую: @crimbr6"
-        )
-
-
+    context.user_data['awaiting_support'] = True
     await update.message.reply_text(
         "🛠️ Техническая поддержка\n\n"
-        "По всем вопросам обращайтесь к разработчику:\n"
-        "👨‍💻 @crimbr6\n\n"
-        "📝 При обращении укажите:\n"
-        "• Описание проблемы\n"
-        "• Ваш ID (если нужно)\n"
-        "• Скриншот ошибки (если есть)"
+        "Напишите ваш вопрос:"
     )
+    return
+
+async def process_support(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name or f"user_{user_id}"
+
 
 async def reply_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPPORT_ADMIN_ID:
         await update.message.reply_text("❌ Эта команда доступна только администратору.")
         return
     
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "❌ Использование: /reply <user_id> <ответ>\n\n"
-            "Пример:\n"
-            "/reply 123456789 Проблема решена, попробуйте снова"
-        )
-        return
-    
-    try:
-        user_id = int(context.args[0])
-        reply_message = " ".join(context.args[1:])
-        
-        reply_text = (
-            f"💬 Ответ от техподдержки:\n\n"
-            f"{reply_message}"
-        )
-        
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=reply_text
-        )
-        
-        await update.message.reply_text(
-            f"✅ Ответ отправлен пользователю {user_id}"
-        )
-        
-    except ValueError:
-        await update.message.reply_text("❌ Неверный ID пользователя")
-    except Exception as e:
-        logger.error(f"Error sending reply: {e}")
-        await update.message.reply_text("❌ Ошибка отправки ответа")
+    context.user_data['awaiting_reply_user'] = True
+    await update.message.reply_text("👤 Введите ID пользователя:")
+    return
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -2072,8 +2503,16 @@ async def mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         
         rank = get_user_rank(published)
+        sub = has_active_subscription(user_id)
+        sub_badge = ""
+        if sub == 'vip':
+            sub_badge = " 👑"
+        elif sub == 'pro':
+            sub_badge = " ⭐"
+        elif sub == 'basic':
+            sub_badge = " 🌟"
         
-        response = f"📊 Статистика @{username}\n\n"
+        response = f"📊 Статистика @{username}{sub_badge}\n\n"
         response += f"{rank} | Мемов: {published}\n"
         response += f"💰 Мемкоины: {balance}\n"
         response += f"🔥 Стрик: {current_streak} дней (рекорд: {longest_streak})\n\n"
@@ -2155,20 +2594,20 @@ async def quests(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     balance, _ = get_user_balance(user_id)
+    sub = has_active_subscription(user_id)
     
     keyboard = [
-        [InlineKeyboardButton("⚡ Приоритет (1000 монет)", callback_data="buy_priority")],
-        [InlineKeyboardButton("🎫 Пропуск модерации (2000 монет)", callback_data="buy_skip")],
-        [InlineKeyboardButton("📌 Закрепить пост (3000 монет)", callback_data="buy_pin")]
+        [InlineKeyboardButton("📦 Одноразовые товары", callback_data="shop_items")],
+        [InlineKeyboardButton("💎 Подписки Premium", callback_data="shop_subs")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    sub_text = f"\n💎 Активна: {sub}" if sub else ""
+    
     await update.message.reply_text(
-        f"🛒 Магазин привилегий\n\n"
-        f"💰 Ваш баланс: {balance} монет\n\n"
-        f"⚡ Приоритет (1000) - ваш мем будет модерироваться первым\n"
-        f"🎫 Пропуск (2000) - мем публикуется без модерации\n"
-        f"📌 Закрепить (3000) - пост будет закреплен на 24ч",
+        f"🛒 Магазин\n\n"
+        f"💰 Баланс: {balance} монет{sub_text}\n\n"
+        f"Выберите категорию:",
         reply_markup=reply_markup
     )
 
@@ -2235,39 +2674,23 @@ async def manual_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPPORT_ADMIN_ID:
         return
     
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "📝 Использование: /update <message_id> <reactions>\n\n"
-            "Пример:\n"
-            "/update 206 3\n\n"
-            "Где 206 - ID сообщения, 3 - количество реакций"
-        )
-        return
+    context.user_data['awaiting_update_msgid'] = True
+    await update.message.reply_text("📝 Введите ID сообщения:")
+    return
+
+async def process_update(update: Update, context: ContextTypes.DEFAULT_TYPE, message_id: int, reactions: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE published_posts SET reactions = %s WHERE message_id = %s", (reactions, message_id))
+    rows = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
     
-    try:
-        message_id = int(context.args[0])
-        reactions = int(context.args[1])
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE published_posts SET reactions = %s WHERE message_id = %s",
-            (reactions, message_id)
-        )
-        rows = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        if rows > 0:
-            await update.message.reply_text(f"✅ Обновлено! Пост {message_id}: {reactions} реакций")
-        else:
-            await update.message.reply_text(f"❌ Пост с ID {message_id} не найден в БД")
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат. Используйте числа.")
-    except Exception as e:
-        logger.error(f"Error updating reactions: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+    if rows > 0:
+        await update.message.reply_text(f"✅ Обновлено! Пост {message_id}: {reactions} реакций")
+    else:
+        await update.message.reply_text(f"❌ Пост с ID {message_id} не найден в БД")
 
 # ФАЗА 4: Функции автоматизации
 def auto_moderate_content(photo_hash: str, file_size: int, caption: str, user_id: int, conn):
@@ -2333,10 +2756,35 @@ def get_growth_stats(channel_id: str, conn):
 
 async def lootbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import random
+    from datetime import date, timedelta
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name
     conn = get_db_connection()
     cur = conn.cursor()
+    
+    # Проверяем подписку для бонусных лутбоксов
+    sub = has_active_subscription(user_id)
+    today = date.today()
+    
+    # Добавляем бонусные лутбоксы от подписки
+    if sub == 'vip':
+        cur.execute("SELECT last_bonus_date FROM user_subscriptions WHERE user_id = %s", (user_id,))
+        last_bonus = cur.fetchone()
+        if not last_bonus or last_bonus[0] != today:
+            cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (%s, %s, 'vip_daily')", (user_id, username))
+            cur.execute("UPDATE user_subscriptions SET last_bonus_date = %s WHERE user_id = %s", (today, user_id))
+            conn.commit()
+    elif sub in ['pro', 'basic']:
+        cur.execute("SELECT last_bonus_date FROM user_subscriptions WHERE user_id = %s", (user_id,))
+        last_bonus = cur.fetchone()
+        week_start = today - timedelta(days=today.weekday())
+        if not last_bonus or last_bonus[0] < week_start:
+            boxes = 2 if sub == 'pro' else 1
+            for _ in range(boxes):
+                cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (%s, %s, %s)", (user_id, username, f'{sub}_weekly'))
+            cur.execute("UPDATE user_subscriptions SET last_bonus_date = %s WHERE user_id = %s", (today, user_id))
+            conn.commit()
+    
     cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
     posts = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM lootboxes WHERE user_id = %s AND opened = FALSE", (user_id,))
@@ -2363,8 +2811,6 @@ async def lootbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     add_coins(user_id, username, reward, "🎁 Лутбокс")
     
-    from datetime import date
-    today = date.today()
     cur.execute("SELECT completed FROM daily_quests WHERE user_id = %s AND quest_date = %s AND quest_type = 'open_lootbox'", (user_id, today))
     quest_result = cur.fetchone()
     if quest_result and not quest_result[0]:
@@ -2403,15 +2849,12 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name
     
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "💸 Перевод мемкоинов\n\n"
-            "Использование: /pay <@username или ID> <сумма>\n\n"
-            "Примеры:\n"
-            "/pay @user 100\n"
-            "/pay 123456789 50"
-        )
-        return
+    context.user_data['awaiting_pay_recipient'] = True
+    await update.message.reply_text(
+        "💸 Перевод мемкоинов\n\n"
+        "Введите @username или ID получателя:"
+    )
+    return
     
     try:
         recipient = context.args[0]
@@ -2672,6 +3115,25 @@ async def update_reactions(context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+async def check_expired_subscriptions(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет и уведомляет об истекших подписках"""
+    from datetime import datetime, timedelta
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, subscription_type FROM user_subscriptions WHERE expires_at <= %s AND expires_at > %s", (datetime.now(), datetime.now() - timedelta(hours=1)))
+    expired = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    for user_id, sub_type in expired:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⏰ Ваша подписка {sub_type.upper()} истекла!\n\nПродлите в /shop"
+            )
+        except:
+            pass
+
 async def publish_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime
     now = datetime.now()
@@ -2694,7 +3156,17 @@ async def publish_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
                 caption=caption if caption else None
             )
             add_published_post(channel_id, user_id, username, msg.message_id)
-            add_coins(user_id, username, 10, "Мем опубликован")
+            # Применяем бонусы подписки
+            sub = has_active_subscription(user_id)
+            coin_bonus = 10
+            if sub == 'vip':
+                coin_bonus = int(10 * 3)
+            elif sub == 'pro':
+                coin_bonus = int(10 * 1.5)
+            elif sub == 'basic':
+                coin_bonus = int(10 * 1.2)
+            
+            add_coins(user_id, username, coin_bonus, "Мем опубликован")
             update_streak(user_id, username)
             check_daily_quests(user_id, username)
             
@@ -2733,6 +3205,7 @@ async def start_bot():
     
     if application.job_queue:
         application.job_queue.run_repeating(publish_scheduled_posts, interval=60, first=10)
+        application.job_queue.run_repeating(check_expired_subscriptions, interval=3600, first=60)
     else:
         logger.warning("JobQueue не доступен. Установите: pip install python-telegram-bot[job-queue]")
     
