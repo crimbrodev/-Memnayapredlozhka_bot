@@ -7,4 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "bot.py"]
+# Initialize SQLite database
+RUN python db_sqlite.py
+
+CMD ["python", "bot_sqlite.py"]
