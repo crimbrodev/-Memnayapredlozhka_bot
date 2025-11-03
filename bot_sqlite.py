@@ -46,7 +46,7 @@ def ban_user(user_id: int, username: str, banned_by: int, channel_id: str):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO banned_users (user_id, channel_id, username, banned_by) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, channel_id) DO NOTHING",
+        "INSERT OR IGNORE INTO banned_users (user_id, channel_id, username, banned_by) VALUES (?, ?, ?, ?)",
         (user_id, channel_id, username, banned_by)
     )
     conn.commit()
@@ -80,7 +80,7 @@ def add_channel(channel_id: str, added_by: int):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO channels (channel_id, added_by) VALUES (%s, %s) ON CONFLICT (channel_id) DO NOTHING",
+        "INSERT OR IGNORE INTO channels (channel_id, added_by) VALUES (?, ?)",
         (channel_id, added_by)
     )
     conn.commit()
@@ -93,7 +93,7 @@ def update_channel_admins(channel_id: str, admins: list):
     cur.execute("DELETE FROM channel_admins WHERE channel_id = ?", (channel_id,))
     for admin in admins:
         cur.execute(
-            "INSERT INTO channel_admins (channel_id, user_id, username) VALUES (%s, %s, %s)",
+            "INSERT INTO channel_admins (channel_id, user_id, username) VALUES (?, ?, ?)",
             (channel_id, admin['user_id'], admin['username'])
         )
     conn.commit()
@@ -105,12 +105,12 @@ def add_pending_post(channel_id: str, user_id: int, username: str, photo_file_id
     cur = conn.cursor()
     if priority:
         cur.execute(
-            "INSERT INTO pending_posts (channel_id, user_id, username, photo_file_id, caption, created_at) VALUES (%s, %s, %s, %s, %s, '1970-01-01')",
+            "INSERT INTO pending_posts (channel_id, user_id, username, photo_file_id, caption, created_at) VALUES (?, ?, ?, ?, ?, '1970-01-01')",
             (channel_id, user_id, username, photo_file_id, caption)
         )
     else:
         cur.execute(
-            "INSERT INTO pending_posts (channel_id, user_id, username, photo_file_id, caption) VALUES (%s, %s, %s, %s, %s)",
+            "INSERT INTO pending_posts (channel_id, user_id, username, photo_file_id, caption) VALUES (?, ?, ?, ?, ?)",
             (channel_id, user_id, username, photo_file_id, caption)
         )
     conn.commit()
@@ -204,7 +204,7 @@ def update_channel_setting(channel_id: str, setting: str, value):
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        query = f"INSERT INTO channel_settings (channel_id, {setting}) VALUES (%s, %s) ON CONFLICT (channel_id) DO UPDATE SET {setting} = %s"
+        query = f"INSERT INTO channel_settings (channel_id, {setting}) VALUES (?, ?) ON CONFLICT(channel_id) DO UPDATE SET {setting} = ?"
         cur.execute(query, (channel_id, value, value))
         conn.commit()
     except Exception as e:
@@ -217,7 +217,7 @@ def update_channel_setting(channel_id: str, setting: str, value):
 def add_scheduled_post(channel_id: str, user_id: int, username: str, photo_file_id: str, caption: str, scheduled_time):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("INSERT INTO scheduled_posts (channel_id, user_id, username, photo_file_id, caption, scheduled_time) VALUES (%s, %s, %s, %s, %s, %s)", (channel_id, user_id, username, photo_file_id, caption, scheduled_time))
+    cur.execute("INSERT INTO scheduled_posts (channel_id, user_id, username, photo_file_id, caption, scheduled_time) VALUES (?, ?, ?, ?, ?, ?)", (channel_id, user_id, username, photo_file_id, caption, scheduled_time))
     conn.commit()
     cur.close()
     conn.close()
@@ -247,7 +247,7 @@ def remove_scheduled_post(post_id: int):
 def log_action(channel_id: str, action: str, user_id: int, admin_id: int, post_id: int = None, details: str = ""):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("INSERT INTO audit_log (channel_id, action, user_id, admin_id, post_id, details) VALUES (%s, %s, %s, %s, %s, %s)", (channel_id, action, user_id, admin_id, post_id, details))
+    cur.execute("INSERT INTO audit_log (channel_id, action, user_id, admin_id, post_id, details) VALUES (?, ?, ?, ?, ?, ?)", (channel_id, action, user_id, admin_id, post_id, details))
     conn.commit()
     cur.close()
     conn.close()
@@ -256,7 +256,7 @@ def add_published_post(channel_id: str, user_id: int, username: str, message_id:
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO published_posts (channel_id, user_id, username, message_id) VALUES (%s, %s, %s, %s)",
+        "INSERT INTO published_posts (channel_id, user_id, username, message_id) VALUES (?, ?, ?, ?)",
         (channel_id, user_id, username, message_id)
     )
     conn.commit()
@@ -279,7 +279,7 @@ def get_global_leaderboard(limit: int = 10):
     cur = conn.cursor()
     cur.execute(
         "SELECT user_id, username, COUNT(*) as posts, COALESCE(SUM(reactions), 0) as total_reactions "
-        "FROM published_posts GROUP BY user_id, username ORDER BY total_reactions DESC, posts DESC LIMIT %s",
+        "FROM published_posts GROUP BY user_id, username ORDER BY total_reactions DESC, posts DESC LIMIT ?",
         (limit,)
     )
     result = cur.fetchall()
@@ -292,7 +292,7 @@ def get_channel_leaderboard(channel_id: str, limit: int = 10):
     cur = conn.cursor()
     cur.execute(
         "SELECT user_id, username, COUNT(*) as posts, COALESCE(SUM(reactions), 0) as total_reactions "
-        "FROM published_posts WHERE channel_id = %s GROUP BY user_id, username ORDER BY total_reactions DESC, posts DESC LIMIT %s",
+        "FROM published_posts WHERE channel_id = ? GROUP BY user_id, username ORDER BY total_reactions DESC, posts DESC LIMIT ?",
         (channel_id, limit)
     )
     result = cur.fetchall()
@@ -304,12 +304,12 @@ def add_coins(user_id: int, username: str, amount: int, reason: str):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO user_coins (user_id, username, balance, total_earned) VALUES (%s, %s, %s, %s) "
-        "ON CONFLICT (user_id) DO UPDATE SET balance = user_coins.balance + %s, total_earned = user_coins.total_earned + %s, username = %s, updated_at = datetime('now')",
+        "INSERT INTO user_coins (user_id, username, balance, total_earned) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET balance = user_coins.balance + ?, total_earned = user_coins.total_earned + ?, username = ?, updated_at = datetime('now')",
         (user_id, username, amount, amount, amount, amount, username)
     )
     cur.execute(
-        "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+        "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)",
         (user_id, amount, reason)
     )
     conn.commit()
@@ -357,17 +357,17 @@ def spend_coins(user_id: int, amount: int, reason: str) -> bool:
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE user_coins SET balance = balance - ? "
-            "WHERE user_id = ? AND balance >= ? RETURNING balance",
-            (amount, user_id, amount)
-        )
+        cur.execute("SELECT balance FROM user_coins WHERE user_id = ?", (user_id,))
         result = cur.fetchone()
-        if not result:
+        if not result or result[0] < amount:
             conn.rollback()
             return False
         cur.execute(
-            "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+            "UPDATE user_coins SET balance = balance - ? WHERE user_id = ?",
+            (amount, user_id)
+        )
+        cur.execute(
+            "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)",
             (user_id, -amount, reason)
         )
         conn.commit()
@@ -387,17 +387,17 @@ def transfer_coins(from_user_id: int, to_user_id: int, amount: int, from_usernam
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE user_coins SET balance = balance - ? "
-            "WHERE user_id = ? AND balance >= ? RETURNING balance",
-            (amount, from_user_id, amount)
-        )
+        cur.execute("SELECT balance FROM user_coins WHERE user_id = ?", (from_user_id,))
         result = cur.fetchone()
-        if not result:
+        if not result or result[0] < amount:
             conn.rollback()
             return False
         cur.execute(
-            "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+            "UPDATE user_coins SET balance = balance - ? WHERE user_id = ?",
+            (amount, from_user_id)
+        )
+        cur.execute(
+            "INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)",
             (from_user_id, -amount, f"💸 Перевод @{to_username}")
         )
         conn.commit()
@@ -423,7 +423,7 @@ def update_streak(user_id: int, username: str):
     today = date.today()
     
     if not result:
-        cur.execute("INSERT INTO user_streaks (user_id, username, current_streak, longest_streak, last_post_date) VALUES (%s, %s, 1, 1, %s)", (user_id, username, today))
+        cur.execute("INSERT INTO user_streaks (user_id, username, current_streak, longest_streak, last_post_date) VALUES (?, ?, 1, 1, ?)", (user_id, username, today))
     else:
         current, longest, last_date = result
         if last_date == today:
@@ -461,14 +461,14 @@ def check_daily_quests(user_id: int, username: str):
     quests = {row[0]: row[1] for row in cur.fetchall()}
     
     if not quests:
-        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'post_1', 10)", (user_id, today))
-        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'post_3', 30)", (user_id, today))
-        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'post_5', 50)", (user_id, today))
-        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'streak_3', 100)", (user_id, today))
-        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (%s, %s, 'open_lootbox', 20)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (?, ?, 'post_1', 10)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (?, ?, 'post_3', 30)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (?, ?, 'post_5', 50)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (?, ?, 'streak_3', 100)", (user_id, today))
+        cur.execute("INSERT INTO daily_quests (user_id, quest_date, quest_type, reward) VALUES (?, ?, 'open_lootbox', 20)", (user_id, today))
         quests = {'post_1': False, 'post_3': False, 'post_5': False, 'streak_3': False, 'open_lootbox': False}
     
-    cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s AND DATE(published_at) = %s", (user_id, today))
+    cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = ? AND DATE(published_at) = ?", (user_id, today))
     posts_today = cur.fetchone()[0]
     
     if posts_today >= 1 and not quests.get('post_1'):
@@ -511,7 +511,7 @@ def buy_shop_item(user_id: int, username: str, item_type: str, cost: int, durati
     conn = get_db_connection()
     cur = conn.cursor()
     expires = datetime.now() + timedelta(hours=duration_hours) if duration_hours > 0 else None
-    cur.execute("INSERT INTO shop_purchases (user_id, username, item_type, cost, expires_at) VALUES (%s, %s, %s, %s, %s)", (user_id, username, item_type, cost, expires))
+    cur.execute("INSERT INTO shop_purchases (user_id, username, item_type, cost, expires_at) VALUES (?, ?, ?, ?, ?)", (user_id, username, item_type, cost, expires))
     conn.commit()
     cur.close()
     conn.close()
@@ -555,7 +555,7 @@ def buy_subscription(user_id: int, username: str, sub_type: str, cost: int, days
     conn = get_db_connection()
     cur = conn.cursor()
     expires = datetime.now() + timedelta(days=days)
-    cur.execute("INSERT INTO user_subscriptions (user_id, subscription_type, expires_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s, expires_at = %s", (user_id, sub_type, expires, sub_type, expires))
+    cur.execute("INSERT INTO user_subscriptions (user_id, subscription_type, expires_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET subscription_type = ?, expires_at = ?", (user_id, sub_type, expires, sub_type, expires))
     conn.commit()
     cur.close()
     conn.close()
@@ -640,7 +640,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if not existing:
                 # Добавляем реферала
-                cur.execute("INSERT INTO referrals (referrer_id, referred_id, referred_username) VALUES (%s, %s, %s)", (referrer_id, user_id, username))
+                cur.execute("INSERT INTO referrals (referrer_id, referred_id, referred_username) VALUES (?, ?, ?)", (referrer_id, user_id, username))
                 cur.execute("UPDATE referral_codes SET total_referrals = total_referrals + 1 WHERE user_id = ?", (referrer_id,))
                 conn.commit()
                 
@@ -1327,7 +1327,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 conn = get_db_connection()
                 cur = conn.cursor()
-                placeholders = ','.join(['%s'] * len(user_channels))
+                placeholders = ','.join(['?'] * len(user_channels))
                 cur.execute(f"SELECT COUNT(*) FROM pending_posts WHERE channel_id IN ({placeholders})", user_channels)
                 pending_count = cur.fetchone()[0]
                 cur.execute(f"SELECT COUNT(*) FROM banned_users WHERE channel_id IN ({placeholders})", user_channels)
@@ -2151,7 +2151,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if channel_id:
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("INSERT INTO channel_protections (user_id, channel_id) VALUES (%s, %s)", (user_id, channel_id))
+            cur.execute("INSERT INTO channel_protections (user_id, channel_id) VALUES (?, ?)", (user_id, channel_id))
             conn.commit()
             cur.close()
             conn.close()
@@ -2285,7 +2285,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 conn = get_db_connection()
                 cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
+                cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = ?", (user_id,))
                 posts_count = cur.fetchone()[0]
                 cur.close()
                 conn.close()
@@ -2676,7 +2676,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = get_db_connection()
         cur = conn.cursor()
         
-        placeholders = ','.join(['%s'] * len(user_channels))
+        placeholders = ','.join(['?'] * len(user_channels))
         cur.execute(f"SELECT COUNT(*) FROM pending_posts WHERE channel_id IN ({placeholders})", user_channels)
         pending_count = cur.fetchone()[0]
         
@@ -2756,16 +2756,16 @@ async def mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = get_db_connection()
         cur = conn.cursor()
         
-        cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
+        cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = ?", (user_id,))
         published = cur.fetchone()[0]
         
-        cur.execute("SELECT COUNT(*) FROM audit_log WHERE user_id = %s AND action = 'rejected'", (user_id,))
+        cur.execute("SELECT COUNT(*) FROM audit_log WHERE user_id = ? AND action = 'rejected'", (user_id,))
         rejected = cur.fetchone()[0]
         
-        cur.execute("SELECT COUNT(*) FROM pending_posts WHERE user_id = %s", (user_id,))
+        cur.execute("SELECT COUNT(*) FROM pending_posts WHERE user_id = ?", (user_id,))
         pending = cur.fetchone()[0]
         
-        cur.execute("SELECT COALESCE(SUM(reactions), 0) FROM published_posts WHERE user_id = %s", (user_id,))
+        cur.execute("SELECT COALESCE(SUM(reactions), 0) FROM published_posts WHERE user_id = ?", (user_id,))
         total_reactions = cur.fetchone()[0]
         
         balance, total_earned = get_user_balance(user_id)
@@ -2923,7 +2923,7 @@ async def weekwinner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     cur.execute(
         "SELECT user_id, username, COUNT(*) as posts, COALESCE(SUM(reactions), 0) as reactions "
-        "FROM published_posts WHERE DATE(published_at) >= %s "
+        "FROM published_posts WHERE DATE(published_at) >= ? "
         "GROUP BY user_id, username ORDER BY reactions DESC LIMIT 1",
         (week_start,)
     )
@@ -3006,7 +3006,7 @@ def auto_moderate_content(photo_hash: str, file_size: int, caption: str, user_id
 
 def get_channel_analytics(channel_id: str, conn):
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM pending_posts WHERE channel_id = %s", (channel_id,))
+    cur.execute("SELECT COUNT(*) FROM pending_posts WHERE channel_id = ?", (channel_id,))
     queue_size = cur.fetchone()[0]
     cur.close()
     return {'queue_size': queue_size}
@@ -3030,9 +3030,9 @@ def calculate_smart_schedule(channel_id: str, conn, aggressiveness: str = 'mediu
 
 def get_approval_rate(channel_id: str, conn):
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM audit_log WHERE channel_id = %s AND action = 'published'", (channel_id,))
+    cur.execute("SELECT COUNT(*) FROM audit_log WHERE channel_id = ? AND action = 'published'", (channel_id,))
     published = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM audit_log WHERE channel_id = %s AND action = 'rejected'", (channel_id,))
+    cur.execute("SELECT COUNT(*) FROM audit_log WHERE channel_id = ? AND action = 'rejected'", (channel_id,))
     rejected = cur.fetchone()[0]
     cur.close()
     total = published + rejected
@@ -3041,16 +3041,16 @@ def get_approval_rate(channel_id: str, conn):
 
 def get_top_authors(channel_id: str, conn, limit: int = 10):
     cur = conn.cursor()
-    cur.execute("SELECT user_id, username, COUNT(*) as posts FROM published_posts WHERE channel_id = %s GROUP BY user_id, username ORDER BY posts DESC LIMIT %s", (channel_id, limit))
+    cur.execute("SELECT user_id, username, COUNT(*) as posts FROM published_posts WHERE channel_id = ? GROUP BY user_id, username ORDER BY posts DESC LIMIT ?", (channel_id, limit))
     result = cur.fetchall()
     cur.close()
     return result
 
 def get_growth_stats(channel_id: str, conn):
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM published_posts WHERE channel_id = %s AND published_at > datetime('now') - /* 7 days - используйте Python timedelta */", (channel_id,))
+    cur.execute("SELECT COUNT(*) FROM published_posts WHERE channel_id = ? AND published_at > datetime('now') - /* 7 days - используйте Python timedelta */", (channel_id,))
     posts_week = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM published_posts WHERE channel_id = %s AND published_at BETWEEN datetime('now') - /* 14 days - используйте Python timedelta */ AND datetime('now') - /* 7 days - используйте Python timedelta */", (channel_id,))
+    cur.execute("SELECT COUNT(*) FROM published_posts WHERE channel_id = ? AND published_at BETWEEN datetime('now') - /* 14 days - используйте Python timedelta */ AND datetime('now') - /* 7 days - используйте Python timedelta */", (channel_id,))
     posts_prev_week = cur.fetchone()[0]
     cur.close()
     posts_growth = ((posts_week - posts_prev_week) / posts_prev_week * 100) if posts_prev_week > 0 else 0
@@ -3073,7 +3073,7 @@ async def lootbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("SELECT last_bonus_date FROM user_subscriptions WHERE user_id = ?", (user_id,))
         last_bonus = cur.fetchone()
         if not last_bonus or last_bonus[0] != today:
-            cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (%s, %s, 'vip_daily')", (user_id, username))
+            cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (?, ?, 'vip_daily')", (user_id, username))
             cur.execute("UPDATE user_subscriptions SET last_bonus_date = ? WHERE user_id = ?", (today, user_id))
             conn.commit()
     elif sub in ['pro', 'basic']:
@@ -3083,20 +3083,20 @@ async def lootbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not last_bonus or last_bonus[0] < week_start:
             boxes = 2 if sub == 'pro' else 1
             for _ in range(boxes):
-                cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (%s, %s, %s)", (user_id, username, f'{sub}_weekly'))
+                cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (?, ?, ?)", (user_id, username, f'{sub}_weekly'))
             cur.execute("UPDATE user_subscriptions SET last_bonus_date = ? WHERE user_id = ?", (today, user_id))
             conn.commit()
     
-    cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
+    cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = ?", (user_id,))
     posts = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM lootboxes WHERE user_id = %s AND opened = 0", (user_id,))
+    cur.execute("SELECT COUNT(*) FROM lootboxes WHERE user_id = ? AND opened = 0", (user_id,))
     available = cur.fetchone()[0]
     earned = posts // 10
-    cur.execute("SELECT COUNT(*) FROM lootboxes WHERE user_id = %s", (user_id,))
+    cur.execute("SELECT COUNT(*) FROM lootboxes WHERE user_id = ?", (user_id,))
     total = cur.fetchone()[0]
     if earned > total:
         for _ in range(earned - total):
-            cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (%s, %s, 'standard')", (user_id, username))
+            cur.execute("INSERT INTO lootboxes (user_id, username, box_type) VALUES (?, ?, 'standard')", (user_id, username))
         conn.commit()
         available = earned - total
     if available == 0:
@@ -3108,7 +3108,7 @@ async def lootbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     box_id = cur.fetchone()[0]
     roll = random.random()
     reward = 500 if roll < 0.01 else 200 if roll < 0.10 else random.randint(20, 100)
-    cur.execute("INSERT INTO lootbox_rewards (lootbox_id, reward_type, reward_value) VALUES (%s, 'coins', %s)", (box_id, reward))
+    cur.execute("INSERT INTO lootbox_rewards (lootbox_id, reward_type, reward_value) VALUES (?, 'coins', ?)", (box_id, reward))
     cur.execute("UPDATE lootboxes SET opened = 1 WHERE id = ?", (box_id,))
     conn.commit()
     add_coins(user_id, username, reward, "🎁 Лутбокс")
@@ -3133,13 +3133,13 @@ async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = cur.fetchone()
     if not result:
         code = hashlib.sha256(f"{user_id}{datetime.now()}".encode()).hexdigest()[:8]
-        cur.execute("INSERT INTO referral_codes (user_id, code) VALUES (%s, %s)", (user_id, code))
+        cur.execute("INSERT INTO referral_codes (user_id, code) VALUES (?, ?)", (user_id, code))
         conn.commit()
     else:
         code = result[0]
     cur.execute("SELECT total_referrals FROM referral_codes WHERE user_id = ?", (user_id,))
     total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND reward_claimed = 1", (user_id,))
+    cur.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND reward_claimed = 1", (user_id,))
     rewarded = cur.fetchone()[0]
     cur.close()
     conn.close()
@@ -3474,7 +3474,7 @@ async def publish_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
             
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = %s", (user_id,))
+            cur.execute("SELECT COUNT(*) FROM published_posts WHERE user_id = ?", (user_id,))
             posts_count = cur.fetchone()[0]
             cur.close()
             conn.close()
@@ -3571,3 +3571,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
